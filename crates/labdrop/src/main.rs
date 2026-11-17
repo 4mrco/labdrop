@@ -3,11 +3,13 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use labdrop_core::{
+    config::LabDropConfig,
     fs_space::{format_bytes, query_disk_space},
     i18n::Lang,
-    network::discover_network_interfaces,
+    network::{discover_network_interfaces, resolve_preferred_interface},
     session::{
-        recover_orphaned_sessions, run_watchdog_process, ActiveSharingSession, SharingStrategy,
+        ensure_interactive_terminal_on_linux, recover_orphaned_sessions, run_watchdog_process,
+        ActiveSharingSession, SharingStrategy,
     },
     smb::{probe_smb_environment, SmbLinuxMode},
     staging::{default_staging_base_dir, stage_selection, SelectionSet},
@@ -129,30 +131,8 @@ impl From<CliStrategy> for SharingStrategy {
 }
 
 fn resolve_initial_lang(cli_lang: Option<&str>) -> Lang {
-    if let Some(s) = cli_lang {
-        if let Some(parsed) = Lang::parse_str(s) {
-            return parsed;
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let cfg = parent.join("config").join("labdrop.toml");
-            if let Ok(content) = fs::read_to_string(cfg) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix("language") {
-                        if let Some((_, val)) = rest.split_once('=') {
-                            let clean = val.split('#').next().unwrap_or("").trim().trim_matches('"');
-                            if let Some(parsed) = Lang::parse_str(clean) {
-                                return parsed;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Lang::detect_from_env()
+    let cfg = LabDropConfig::load();
+    cfg.resolved_lang(cli_lang)
 }
 
 fn main() -> Result<()> {
@@ -179,8 +159,16 @@ fn main() -> Result<()> {
     let top_paths = cli.paths;
 
     match cli.command {
-        None => tui::run_tui(lang, top_paths),
+        None => {
+            if ensure_interactive_terminal_on_linux() {
+                return Ok(());
+            }
+            tui::run_tui(lang, top_paths)
+        }
         Some(Commands::Tui { paths }) => {
+            if ensure_interactive_terminal_on_linux() {
+                return Ok(());
+            }
             let combined = if paths.is_empty() { top_paths } else { paths };
             tui::run_tui(lang, combined)
         }
@@ -299,6 +287,7 @@ fn run_cli_share(
     }
 
     let ifaces = discover_network_interfaces();
+    let cfg = LabDropConfig::load();
     let chosen_iface = if let Some(ref f) = interface_filter {
         ifaces
             .iter()
@@ -306,8 +295,12 @@ fn run_cli_share(
             .cloned()
             .with_context(|| format!("Network interface '{f}' not found"))?
     } else {
+        let (idx, warn) = resolve_preferred_interface(&ifaces, cfg.preferred_interface.as_deref(), Lang::En);
+        if let Some(w) = warn {
+            println!("Notice: {w}");
+        }
         ifaces
-            .first()
+            .get(idx)
             .cloned()
             .context("No network interfaces discovered")?
     };

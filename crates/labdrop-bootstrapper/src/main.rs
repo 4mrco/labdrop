@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -15,7 +15,7 @@ use labdrop_core::{
     },
     fs_space::{format_bytes, query_disk_space},
     i18n::Lang,
-    session::is_terminal_disconnected,
+    session::{ensure_interactive_terminal_on_linux, is_terminal_disconnected},
     staging::parse_dropped_paths,
 };
 use ratatui::{
@@ -34,6 +34,13 @@ use std::{
     time::Duration,
 };
 
+const ACCENT: Color = Color::Cyan;
+const TEXT: Color = Color::White;
+const MUTED: Color = Color::Gray;
+const BORDER_MUTED: Color = Color::DarkGray;
+const STATUS_OK: Color = Color::Green;
+const STATUS_ERR: Color = Color::Red;
+
 fn tr<'a>(lang: Lang, en: &'a str, pt: &'a str) -> &'a str {
     match lang {
         Lang::En => en,
@@ -45,7 +52,7 @@ fn tr<'a>(lang: Lang, en: &'a str, pt: &'a str) -> &'a str {
 #[command(
     name = "labdrop-bootstrapper",
     version,
-    about = "LabDrop USB Bootstrapper — Prepares or updates a cross-platform LabDrop USB drive containing both Windows and Linux executables"
+    about = "LabDrop Bootstrapper — Installs or updates LabDrop on a USB drive (Portable) or local computer folder"
 )]
 struct Cli {
     /// Destination directory or USB mount point (launches interactive TUI if omitted).
@@ -98,9 +105,9 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             let title = if report.was_update {
-                "=== LabDrop USB Package Updated Successfully ==="
+                "=== LabDrop Package Updated Successfully ==="
             } else {
-                "=== LabDrop USB Package Prepared Successfully ==="
+                "=== LabDrop Package Installed Successfully ==="
             };
             println!("\n{title}");
             println!("Package Directory:   {}", report.labdrop_dir.display());
@@ -120,6 +127,11 @@ fn main() -> Result<()> {
             println!("Config Directory:    {}", report.config_dir.display());
             println!("Checksums Manifest:  {}", report.checksums_file.display());
         }
+        return Ok(());
+    }
+
+    // If launched by double-clicking in a Linux GUI file manager without a TTY, auto-spawn a terminal window
+    if ensure_interactive_terminal_on_linux() {
         return Ok(());
     }
 
@@ -169,14 +181,20 @@ fn run_bootstrapper_tui(
         logs: vec![
             tr(
                 lang,
-                "Select a USB drive or folder and press Enter to install or update LabDrop.",
-                "Selecione um pendrive ou pasta e pressione Enter para instalar ou atualizar o LabDrop.",
+                "Choose a USB drive (portable) or local computer folder, then press Enter or click [Install / Update].",
+                "Escolha um pendrive USB (portátil) ou pasta local no computador e pressione Enter ou clique em [Instalar / Atualizar].",
             )
             .to_string(),
             tr(
                 lang,
-                "Note: Never formats your drive; updates preserve existing files/ and config/.",
-                "Nota: Nunca formata o pendrive; atualizações preservam suas pastas files/ e config/.",
+                "Safe operation: never formats drives; updates preserve your existing files/ and config/ folders.",
+                "Operação segura: nunca formata unidades; atualizações preservam suas pastas files/ e config/.",
+            )
+            .to_string(),
+            tr(
+                lang,
+                "Note: Installs LabDrop executables only (Windows + Linux). Does not install system packages like Samba.",
+                "Nota: Instala apenas os executáveis do LabDrop (Windows + Linux). Não instala pacotes do sistema como o Samba.",
             )
             .to_string(),
         ],
@@ -189,7 +207,12 @@ fn run_bootstrapper_tui(
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -201,6 +224,7 @@ fn run_bootstrapper_tui(
         let _ = disable_raw_mode();
         let _ = execute!(
             terminal.backend_mut(),
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -239,6 +263,33 @@ fn add_or_select_custom_dest(app: &mut BootstrapperTuiApp, path: PathBuf) {
         },
     );
     app.selected_idx = 0;
+}
+
+fn trigger_install(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut BootstrapperTuiApp,
+) {
+    if let Some(dest) = app.candidates.get(app.selected_idx).cloned() {
+        app.error = None;
+        app.report = None;
+        app.logs.clear();
+        let source = if app.use_offline_local {
+            ArtifactSource::LocalDirectory(app.local_dir.clone())
+        } else {
+            ArtifactSource::ReleaseBaseUrl(app.release_url.clone())
+        };
+        let res = prepare_usb_package(&dest.path, &source, |step| {
+            app.logs.push(step.to_string());
+            let _ = terminal.draw(|f| draw_bootstrapper_ui(f, app));
+        });
+        match res {
+            Ok(rep) => {
+                app.report = Some(rep);
+                app.candidates = discover_candidate_destinations();
+            }
+            Err(e) => app.error = Some(format!("{e}")),
+        }
+    }
 }
 
 fn spawn_input_reader() -> mpsc::Receiver<Event> {
@@ -282,111 +333,94 @@ fn run_loop(
                     }
                 }
             }
+            Ok(Event::Mouse(mouse)) => {
+                let area = terminal.size().map(|s| Rect::new(0, 0, s.width, s.height)).unwrap_or_default();
+                handle_mouse_event(terminal, app, mouse, area);
+            }
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        app.should_quit = true;
-                        continue;
-                    }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+                {
+                    app.should_quit = true;
+                    continue;
+                }
 
-                    if app.modal != InputModal::None {
-                        match key.code {
-                            KeyCode::Esc => app.modal = InputModal::None,
-                            KeyCode::Backspace => {
-                                app.modal_buffer.pop();
-                            }
-                            KeyCode::Enter => {
-                                let raw = std::mem::take(&mut app.modal_buffer);
-                                let cleaned = raw.trim().trim_matches('"').trim_matches('\'');
-                                match app.modal {
-                                    InputModal::CustomDest => {
-                                        if !cleaned.is_empty() {
-                                            add_or_select_custom_dest(app, PathBuf::from(cleaned));
-                                        }
-                                    }
-                                    InputModal::CustomSource => {
-                                        if !cleaned.is_empty() {
-                                            if cleaned.starts_with("http://")
-                                                || cleaned.starts_with("https://")
-                                            {
-                                                app.release_url = cleaned.to_string();
-                                                app.use_offline_local = false;
-                                            } else {
-                                                app.local_dir = PathBuf::from(cleaned);
-                                                app.use_offline_local = true;
-                                            }
-                                        }
-                                    }
-                                    InputModal::None => {}
-                                }
-                                app.modal = InputModal::None;
-                            }
-                            KeyCode::Char(c) => {
-                                app.modal_buffer.push(c);
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
+                if app.modal != InputModal::None {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                        KeyCode::Char('l') | KeyCode::Char('L') => {
-                            app.lang = app.lang.toggle();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.selected_idx = app.selected_idx.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if app.selected_idx + 1 < app.candidates.len() {
-                                app.selected_idx += 1;
-                            }
-                        }
-                        KeyCode::Tab | KeyCode::Char('m') => {
-                            app.use_offline_local = !app.use_offline_local;
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            app.modal_buffer.clear();
-                            app.modal = InputModal::CustomDest;
-                        }
-                        KeyCode::Char('u') | KeyCode::Char('U') => {
-                            app.modal_buffer = if app.use_offline_local {
-                                app.local_dir.display().to_string()
-                            } else {
-                                app.release_url.clone()
-                            };
-                            app.modal = InputModal::CustomSource;
-                        }
-                        KeyCode::Char('r') => {
-                            app.candidates = discover_candidate_destinations();
-                            app.selected_idx = 0;
+                        KeyCode::Esc => app.modal = InputModal::None,
+                        KeyCode::Backspace => {
+                            app.modal_buffer.pop();
                         }
                         KeyCode::Enter => {
-                            if let Some(dest) = app.candidates.get(app.selected_idx).cloned() {
-                                app.error = None;
-                                app.report = None;
-                                app.logs.clear();
-                                let source = if app.use_offline_local {
-                                    ArtifactSource::LocalDirectory(app.local_dir.clone())
-                                } else {
-                                    ArtifactSource::ReleaseBaseUrl(app.release_url.clone())
-                                };
-                                let res = prepare_usb_package(&dest.path, &source, |step| {
-                                    app.logs.push(step.to_string());
-                                    let _ = terminal.draw(|f| draw_bootstrapper_ui(f, app));
-                                });
-                                match res {
-                                    Ok(rep) => {
-                                        app.report = Some(rep);
-                                        app.candidates = discover_candidate_destinations();
+                            let raw = std::mem::take(&mut app.modal_buffer);
+                            let cleaned = raw.trim().trim_matches('"').trim_matches('\'');
+                            match app.modal {
+                                InputModal::CustomDest => {
+                                    if !cleaned.is_empty() {
+                                        add_or_select_custom_dest(app, PathBuf::from(cleaned));
                                     }
-                                    Err(e) => app.error = Some(format!("{e}")),
                                 }
+                                InputModal::CustomSource => {
+                                    if !cleaned.is_empty() {
+                                        if cleaned.starts_with("http://")
+                                            || cleaned.starts_with("https://")
+                                        {
+                                            app.release_url = cleaned.to_string();
+                                            app.use_offline_local = false;
+                                        } else {
+                                            app.local_dir = PathBuf::from(cleaned);
+                                            app.use_offline_local = true;
+                                        }
+                                    }
+                                }
+                                InputModal::None => {}
                             }
+                            app.modal = InputModal::None;
+                        }
+                        KeyCode::Char(c) => {
+                            app.modal_buffer.push(c);
                         }
                         _ => {}
                     }
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        app.lang = app.lang.toggle();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.selected_idx = app.selected_idx.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if app.selected_idx + 1 < app.candidates.len() {
+                            app.selected_idx += 1;
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Char('m') => {
+                        app.use_offline_local = !app.use_offline_local;
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        app.modal_buffer.clear();
+                        app.modal = InputModal::CustomDest;
+                    }
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        app.modal_buffer = if app.use_offline_local {
+                            app.local_dir.display().to_string()
+                        } else {
+                            app.release_url.clone()
+                        };
+                        app.modal = InputModal::CustomSource;
+                    }
+                    KeyCode::Char('r') => {
+                        app.candidates = discover_candidate_destinations();
+                        app.selected_idx = 0;
+                    }
+                    KeyCode::Enter => {
+                        trigger_install(terminal, app);
+                    }
+                    _ => {}
+                }
             }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -396,6 +430,100 @@ fn run_loop(
     Ok(())
 }
 
+fn handle_mouse_event(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut BootstrapperTuiApp,
+    mouse: MouseEvent,
+    area: Rect,
+) {
+    if app.modal != InputModal::None {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.selected_idx = app.selected_idx.saturating_sub(1);
+        }
+        MouseEventKind::ScrollDown => {
+            if app.selected_idx + 1 < app.candidates.len() {
+                app.selected_idx += 1;
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(8),
+                    Constraint::Length(5),
+                    Constraint::Min(6),
+                    Constraint::Length(3),
+                ])
+                .split(area);
+
+            let row = mouse.row;
+            let col = mouse.column;
+
+            // Top bar: clicking on the right side toggles language [L]
+            if row >= chunks[0].y && row < chunks[0].y + chunks[0].height {
+                if col + 16 >= chunks[0].x + chunks[0].width {
+                    app.lang = app.lang.toggle();
+                }
+                return;
+            }
+
+            // Section 1: Destination list
+            if row > chunks[1].y && row + 1 < chunks[1].y + chunks[1].height {
+                let clicked_idx = (row - chunks[1].y - 1) as usize;
+                if clicked_idx < app.candidates.len() {
+                    app.selected_idx = clicked_idx;
+                }
+                return;
+            }
+
+            // Section 2: Action buttons
+            if row > chunks[2].y && row + 1 < chunks[2].y + chunks[2].height {
+                let rel_row = row - chunks[2].y - 1;
+                if rel_row == 0 {
+                    app.use_offline_local = !app.use_offline_local;
+                } else if rel_row == 1 {
+                    let third = chunks[2].width / 3;
+                    if col < chunks[2].x + third {
+                        trigger_install(terminal, app);
+                    } else if col < chunks[2].x + third * 2 {
+                        app.modal_buffer.clear();
+                        app.modal = InputModal::CustomDest;
+                    } else {
+                        app.candidates = discover_candidate_destinations();
+                        app.selected_idx = 0;
+                    }
+                }
+                return;
+            }
+
+            // Bottom shortcut bar
+            if row >= chunks[4].y && row < chunks[4].y + chunks[4].height {
+                let w = chunks[4].width.max(1);
+                let fifth = w / 5;
+                if col < fifth {
+                    trigger_install(terminal, app);
+                } else if col < fifth * 2 {
+                    app.modal_buffer.clear();
+                    app.modal = InputModal::CustomDest;
+                } else if col < fifth * 3 {
+                    app.candidates = discover_candidate_destinations();
+                    app.selected_idx = 0;
+                } else if col < fifth * 4 {
+                    app.lang = app.lang.toggle();
+                } else {
+                    app.should_quit = true;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -403,31 +531,37 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
             Constraint::Length(3),
             Constraint::Length(8),
             Constraint::Length(5),
-            Constraint::Min(8),
+            Constraint::Min(6),
+            Constraint::Length(3),
         ])
         .split(f.area());
 
     let hdr = Paragraph::new(Line::from(vec![
         Span::styled(
-            concat!(" LabDrop USB Bootstrapper v", env!("CARGO_PKG_VERSION"), " "),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            concat!(" LabDrop Bootstrapper v", env!("CARGO_PKG_VERSION"), " "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(tr(
-            app.lang,
-            "— Installs or Updates Windows (LabDrop.exe) + Linux (labdrop)  ",
-            "— Instala ou Atualiza Windows (LabDrop.exe) + Linux (labdrop)  ",
-        )),
+        Span::styled(
+            tr(
+                app.lang,
+                "— Portable USB & Local PC Installer (Windows + Linux)  ",
+                "— Instalador Portátil (USB) e Local (PC) (Windows + Linux)  ",
+            ),
+            Style::default().fg(MUTED),
+        ),
         Span::styled(
             format!(" [L] {} ", app.lang.code()),
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT)),
+    );
     f.render_widget(hdr, chunks[0]);
 
     let items: Vec<ListItem> = app
@@ -435,11 +569,11 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let m = if i == app.selected_idx { "(●)" } else { "( )" };
+            let m = if i == app.selected_idx { "▸" } else { " " };
             let style = if c.has_existing_labdrop {
-                Style::default().fg(Color::Green)
+                Style::default().fg(STATUS_OK)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(TEXT)
             };
             ListItem::new(format!(" {m} {}", c.label)).style(style)
         })
@@ -453,17 +587,18 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .title(tr(
                     app.lang,
-                    " 1. Select USB Drive / Destination (Up/Down | d: Custom Path | r: Refresh) ",
-                    " 1. Selecionar Pendrive / Destino (Setas | d: Caminho Manual | r: Atualizar) ",
+                    " 1. Destination: USB Drive (Portable) or Local Folder ",
+                    " 1. Destino: Pendrive USB (Portátil) ou Pasta Local no Computador ",
                 ))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT)),
         );
     f.render_stateful_widget(list, chunks[1], &mut state);
 
@@ -482,8 +617,8 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
             "{}: {}",
             tr(
                 app.lang,
-                "Online Release Download",
-                "Download Online de Release"
+                "GitHub Release Download (Online)",
+                "Download do GitHub Releases (Online)"
             ),
             app.release_url
         )
@@ -491,34 +626,60 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
     let mode_box = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                tr(app.lang, " [Tab / m] Source: ", " [Tab / m] Origem: "),
-                Style::default().fg(Color::Yellow),
+                tr(app.lang, " [Tab/m] Source: ", " [Tab/m] Origem: "),
+                Style::default().fg(MUTED),
             ),
             Span::styled(
                 src_desc,
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                tr(app.lang, "   ([u] Edit URL/Path)", "   ([u] Editar URL/Caminho)"),
+                Style::default().fg(MUTED),
             ),
         ]),
-        Line::from(tr(
-            app.lang,
-            " [Enter] Install / Update Pendrive   |   [u] Edit Source/URL   |   [q / Esc] Quit",
-            " [Enter] Instalar / Atualizar Pendrive   |   [u] Editar Origem/URL   |   [q / Esc] Sair",
-        )),
+        Line::from(vec![
+            Span::styled(
+                tr(
+                    app.lang,
+                    " [Enter] Install / Update LabDrop ",
+                    " [Enter] Instalar / Atualizar LabDrop ",
+                ),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                tr(app.lang, " [d] Custom Destination ", " [d] Outro Caminho "),
+                Style::default().fg(ACCENT),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                tr(app.lang, " [r] Refresh Drives ", " [r] Atualizar Unidades "),
+                Style::default().fg(ACCENT),
+            ),
+        ]),
     ])
     .block(
         Block::default()
             .title(tr(
                 app.lang,
-                " 2. Artifact Source & Action ",
-                " 2. Origem dos Binários e Ação ",
+                " 2. Source & Actions (Click or Press Key) ",
+                " 2. Origem e Ações (Clique ou Teclado) ",
             ))
-            .borders(Borders::ALL),
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER_MUTED)),
     );
     f.render_widget(mode_box, chunks[2]);
 
     let mut out_lines = Vec::new();
     for l in &app.logs {
-        out_lines.push(Line::from(format!(" • {l}")));
+        out_lines.push(Line::from(Span::styled(
+            format!(" • {l}"),
+            Style::default().fg(MUTED),
+        )));
     }
     if let Some(ref rep) = app.report {
         out_lines.push(Line::from(""));
@@ -526,18 +687,18 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
             tr(
                 app.lang,
                 "SUCCESS: Updated existing LabDrop installation",
-                "SUCESSO: Instalação LabDrop existente atualizada",
+                "SUCESSO: Instalação do LabDrop atualizada",
             )
         } else {
             tr(
                 app.lang,
-                "SUCCESS: LabDrop USB package ready",
-                "SUCESSO: Pacote USB LabDrop pronto",
+                "SUCCESS: LabDrop package installed and verified",
+                "SUCESSO: Pacote LabDrop instalado e verificado",
             )
         };
         out_lines.push(Line::from(Span::styled(
-            format!(" ✓ {msg} at '{}'", rep.labdrop_dir.display()),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            format!(" ✓ {msg} -> {}", rep.labdrop_dir.display()),
+            Style::default().fg(STATUS_OK).add_modifier(Modifier::BOLD),
         )));
         out_lines.push(Line::from(format!(
             "   - Linux:   {} ({}, SHA-256: {}…)",
@@ -556,7 +717,7 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
         out_lines.push(Line::from(""));
         out_lines.push(Line::from(Span::styled(
             format!(" ✗ {}: {err}", tr(app.lang, "ERROR", "ERRO")),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(STATUS_ERR).add_modifier(Modifier::BOLD),
         )));
     }
 
@@ -569,9 +730,29 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
                     " 3. Verification & Status Log ",
                     " 3. Verificação e Log de Status ",
                 ))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER_MUTED)),
         );
     f.render_widget(status_panel, chunks[3]);
+
+    let shortcuts = Line::from(vec![
+        Span::styled(" [Enter] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(tr(app.lang, "Install/Update  ", "Instalar/Atualizar  "), Style::default().fg(MUTED)),
+        Span::styled("[d] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(tr(app.lang, "Custom Path  ", "Caminho Manual  "), Style::default().fg(MUTED)),
+        Span::styled("[r] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(tr(app.lang, "Refresh  ", "Atualizar  "), Style::default().fg(MUTED)),
+        Span::styled("[L] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(tr(app.lang, "Language  ", "Idioma  "), Style::default().fg(MUTED)),
+        Span::styled("[q/Esc] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(tr(app.lang, "Quit", "Sair"), Style::default().fg(MUTED)),
+    ]);
+    let footer = Paragraph::new(shortcuts).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER_MUTED)),
+    );
+    f.render_widget(footer, chunks[4]);
 
     if app.modal != InputModal::None {
         draw_input_modal(f, app);
@@ -585,8 +766,8 @@ fn draw_input_modal(f: &mut Frame, app: &BootstrapperTuiApp) {
     let title = match app.modal {
         InputModal::CustomDest => tr(
             app.lang,
-            " Enter Custom Destination / USB Mount Path ",
-            " Digitar Caminho do Pendrive / Destino ",
+            " Enter Custom Destination (USB Mount or Local Folder) ",
+            " Digitar Caminho de Destino (Pendrive USB ou Pasta Local) ",
         ),
         InputModal::CustomSource => tr(
             app.lang,
@@ -600,8 +781,12 @@ fn draw_input_modal(f: &mut Frame, app: &BootstrapperTuiApp) {
         Line::from(format!(" > {}_", app.modal_buffer)),
         Line::from(""),
         Line::from(Span::styled(
-            tr(app.lang, "[Enter] Confirm  |  [Esc] Cancel", "[Enter] Confirmar  |  [Esc] Cancelar"),
-            Style::default().fg(Color::Cyan),
+            tr(
+                app.lang,
+                "[Enter] Confirm  |  [Esc] Cancel",
+                "[Enter] Confirmar  |  [Esc] Cancelar",
+            ),
+            Style::default().fg(ACCENT),
         )),
     ])
     .wrap(Wrap { trim: false })
@@ -609,7 +794,7 @@ fn draw_input_modal(f: &mut Frame, app: &BootstrapperTuiApp) {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(ACCENT)),
     );
     f.render_widget(p, area);
 }

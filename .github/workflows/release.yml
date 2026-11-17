@@ -87,7 +87,8 @@ jobs:
         run: |
           chmod +x dist/labdrop dist/labdrop-bootstrapper
           cd dist
-          sha256sum labdrop LabDrop.exe labdrop-bootstrapper labdrop-bootstrapper.exe > SHA256SUMS.txt
+          tar --mode='0755' -czf labdrop-bootstrapper-linux-x86_64.tar.gz labdrop-bootstrapper
+          sha256sum labdrop LabDrop.exe labdrop-bootstrapper labdrop-bootstrapper.exe labdrop-bootstrapper-linux-x86_64.tar.gz > SHA256SUMS.txt
           cd ..
           ./dist/labdrop-bootstrapper --dest ./usb_verified --source-dir ./dist
           test -f ./usb_verified/LabDrop/labdrop
@@ -103,4 +104,5 @@ jobs:
             dist/LabDrop.exe
             dist/labdrop-bootstrapper
             dist/labdrop-bootstrapper.exe
+            dist/labdrop-bootstrapper-linux-x86_64.tar.gz
             dist/SHA256SUMS.txt

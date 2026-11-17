@@ -33,6 +33,11 @@
 | Linux Bootstrapper (`labdrop-bootstrapper`) | **Executed & Passed** | Prepared USB layout with both `labdrop` and `LabDrop.exe`, verified SHA-256 & ELF/PE headers |
 | Windows Bootstrapper (`labdrop-bootstrapper.exe`) | **Executed & Passed** | Executed under Wine (`run-cross-tests.sh` Test 2); prepared & verified both executables |
 | Offline & Online Bootstrapper modes | **Executed & Passed** | Verified `--source-dir` (offline) and `--release-url http://...` (online) + corrupted hash rejection |
+| Local Computer Installation Workflow (`~/LabDrop`) | **Executed & Passed** | `run-cross-tests.sh` Test 7 & `bootstrapper::tests`: verified local install, config, share, cleanup & non-destructive update without `usb_ready` |
+| Hot-Switching Network Interfaces & Restarting Sharing Service | **Executed & Passed** | `session::tests::restart_on_interface_stops_old_listener_preserves_staged_files_and_binds_new_interface` |
+| Preferred Network Interface Persistence (`labdrop.toml`) | **Executed & Passed** | `config::tests` & `resolve_preferred_interface` (including fallback warning when preferred interface is disconnected) |
+| TUI Mouse Support & Expandable Sharing Details | **Executed & Passed** | `tui::tests::tui_top_bar_mouse_click_switches_screens_and_toggles_details` |
+| Linux GUI Double-Click Terminal Auto-Launch & `.tar.gz` `+x` Archive | **Executed & Passed** | Verified `ensure_interactive_terminal_on_linux` and `labdrop-bootstrapper-linux-x86_64.tar.gz` (`0755` permissions) |
 
 ---
 

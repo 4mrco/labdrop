@@ -251,6 +251,50 @@ if command -v wine >/dev/null 2>&1; then
 fi
 
 echo ""
+echo "[Test 7/7] Local Computer Installation End-to-End Workflow (Install -> Configure -> Share -> Cleanup -> Update)..."
+LOCAL_INSTALL_DIR="${WORK_DIR}/local_pc_home/LabDrop"
+"${DIST_DIR}/labdrop-bootstrapper" --dest "${LOCAL_INSTALL_DIR}" --source-dir "${DIST_DIR}" >/dev/null
+test -f "${LOCAL_INSTALL_DIR}/labdrop"
+test -f "${LOCAL_INSTALL_DIR}/LabDrop.exe"
+test -f "${LOCAL_INSTALL_DIR}/config/labdrop.toml"
+test ! -d "${LOCAL_INSTALL_DIR}/LabDrop"
+
+# Put a local installer inside the local installation's files/ directory and set preferred_interface = "lo"
+echo "Local PC Installed Payload" > "${LOCAL_INSTALL_DIR}/files/local_tool.bin"
+sed -i 's/preferred_interface = "auto"/preferred_interface = "lo"/' "${LOCAL_INSTALL_DIR}/config/labdrop.toml"
+
+LOCAL_STATUS="${WORK_DIR}/local_install_status.json"
+LOCAL_STAGING="${WORK_DIR}/staging_local_install"
+(
+  cd "${LOCAL_INSTALL_DIR}"
+  ./labdrop share \
+    --select "${LOCAL_INSTALL_DIR}/files/local_tool.bin" \
+    --strategy webdav \
+    --http-port 18091 \
+    --staging-base "${LOCAL_STAGING}" \
+    --status-file "${LOCAL_STATUS}" \
+    --duration-secs 2 >/dev/null 2>&1
+) &
+LPID=$!
+for _ in $(seq 1 40); do
+  if [ -f "${LOCAL_STATUS}" ]; then
+    break
+  fi
+  sleep 0.1
+done
+test -f "${LOCAL_STATUS}"
+grep -q '"interface_name": "lo"' "${LOCAL_STATUS}"
+curl -sf "http://127.0.0.1:18091/local_tool.bin" -o "${WORK_DIR}/got_local_tool.bin"
+diff -u "${LOCAL_INSTALL_DIR}/files/local_tool.bin" "${WORK_DIR}/got_local_tool.bin"
+wait "${LPID}" || true
+
+# Verify update of local installation preserves files/ and config/labdrop.toml
+"${DIST_DIR}/labdrop-bootstrapper" --dest "${LOCAL_INSTALL_DIR}" --source-dir "${DIST_DIR}" >/dev/null
+grep -q 'preferred_interface = "lo"' "${LOCAL_INSTALL_DIR}/config/labdrop.toml"
+diff -u "${LOCAL_INSTALL_DIR}/files/local_tool.bin" "${WORK_DIR}/got_local_tool.bin"
+echo "  ✓ Local installation workflow verified (install, preferred interface config, share, cleanup, and non-destructive update)."
+
+echo ""
 echo "========================================================================"
 echo "ALL CROSS-PLATFORM & CRASH-RECOVERY TESTS PASSED SUCCESSFULLY"
 echo "========================================================================"

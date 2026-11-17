@@ -22,10 +22,11 @@ cp -f "${ROOT_DIR}/target/x86_64-pc-windows-gnu/release/labdrop-bootstrapper.exe
 
 chmod +x "${DIST_DIR}/labdrop" "${DIST_DIR}/labdrop-bootstrapper"
 
-echo "[4/5] Generating SHA256SUMS.txt..."
+echo "[4/5] Packaging Linux .tar.gz archive (preserving +x executable bit) and generating SHA256SUMS.txt..."
 (
   cd "${DIST_DIR}"
-  sha256sum labdrop LabDrop.exe labdrop-bootstrapper labdrop-bootstrapper.exe > SHA256SUMS.txt
+  tar --mode='0755' -czf labdrop-bootstrapper-linux-x86_64.tar.gz labdrop-bootstrapper
+  sha256sum labdrop LabDrop.exe labdrop-bootstrapper labdrop-bootstrapper.exe labdrop-bootstrapper-linux-x86_64.tar.gz > SHA256SUMS.txt
 )
 
 echo "[5/5] Verifying release artifacts..."

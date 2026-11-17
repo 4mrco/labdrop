@@ -1,146 +1,231 @@
-# LabDrop — Cross-Platform Laboratory File Distribution Utility
+# LabDrop
 
-**LabDrop** is a lightweight, portable, cross-platform file distribution utility built for computer laboratories running mixed operating systems (**Windows 10/11**, **Fedora Linux**, **Ubuntu Linux**, and **Linux Mint**).
+**Distribuição rápida, portátil e temporária de arquivos para laboratórios de informática (Windows 10/11 e Linux).**
 
-It solves a single focused problem: distributing installers, archives, or classroom materials from a USB drive (or local directories) on one transmitting computer to multiple destination computers on the local network **without installing any agent, runtime, or software on destination machines**.
+O **LabDrop** resolve um problema prático de laboratório: você precisa distribuir alguns instaladores, apostilas ou pastas para vários computadores de uma sala (rodando Windows 10/11, Fedora, Ubuntu ou Linux Mint) sem precisar instalar agentes, configurar servidores permanentes ou passar o pendrive de máquina em máquina.
 
----
-
-## Key Features
-
-- **Zero Destination Dependencies**: Destination computers access files using their native file manager (`File Explorer` on Windows 10/11, `Files / Nautilus` on Fedora & Ubuntu, `Nemo` on Linux Mint) or any standard web browser.
-- **Internal Storage Staging**: Copies selected files and folders from the USB drive (or anywhere on the transmitting PC) to an internal temporary staging directory before sharing—protecting original files, preventing slow concurrent USB reads, checking available disk space upfront, and automatically disambiguating duplicate filenames (`installer (2).exe`).
-- **Layered Network Sharing Architecture**:
-  1. **Primary — SMB**:
-     - **Linux Transmitters (Samba)**: Automatically detects Fedora (`dnf`, `smb.service`, `firewalld`) vs Ubuntu/Linux Mint (`apt-get`, `smbd.service`, `ufw`). Supports both **Standard Port 445 System Mode** (with administrator elevation) and **Rootless Port 4445 Mode** (isolated user-namespace `smbd` requiring zero root privileges).
-     - **Windows Transmitters (Native SMB)**: Uses built-in Windows `LanmanServer` (`New-SmbShare` / `net share`) with locale-independent `Everyone` SID (`*S-1-1-0`) read-only permissions and a session-scoped Windows Firewall rule.
-  2. **Secondary — Read-Only WebDAV (RFC 4918)**:
-     - Built-in standards-compliant WebDAV server (`OPTIONS`, `PROPFIND`, `GET`, `HEAD`, HTTP Range requests) that works natively in Linux file managers (`dav://<ip>:<port>/LabDrop/`) and Windows Explorer (`\\<ip>@<port>\DavWWWRoot\LabDrop`) with zero external dependencies and no administrator privileges required.
-  3. **Last Fallback — Embedded HTTP Server + On-the-Fly `.ZIP` Streaming**:
-     - Clean web interface with individual file downloads, `SHA256SUMS.txt` manifest, and one-click **Download Folder as `.ZIP`** streaming (`?zip=1`), plus best-effort mDNS (`.local`) advertisement alongside direct IP URLs.
-- **Crash-Safe Session Cleanup & Real-Time Watchdog**:
-  - Tracks every session resource in an atomic `session.json` ownership ledger.
-  - Spawns a detached watchdog process (`--internal-watchdog`) linked via an OS pipe so even an abrupt crash (`SIGKILL` / `kill -9`) immediately terminates temporary shares, daemons, firewall rules, and staged files.
-- **Cross-Platform USB Bootstrapper**:
-  - Standalone executables for both Linux (`labdrop-bootstrapper`) and Windows (`labdrop-bootstrapper.exe`) that prepare a complete portable `LabDrop/` USB directory containing **both** `LabDrop.exe` (Windows x86-64) and `labdrop` (Linux x86-64), verified by SHA-256 checksums and ELF/PE binary header inspection.
+Os computadores de destino **não precisam ter o LabDrop instalado** — eles acessam os arquivos diretamente pelo gerenciador de arquivos nativo (Windows Explorer / Linux Arquivos) ou pelo navegador web.
 
 ---
 
-## USB Package Layout
+## Sumário
 
-When prepared by `labdrop-bootstrapper`, your USB drive contains:
+1. [Instalação Rápida (GitHub Releases)](#1-instalação-rápida-github-releases)
+2. [Modos de Instalação: Portátil (Pendrive) vs. Local (Computador)](#2-modos-de-instalação-portátil-pendrive-vs-local-computador)
+3. [Como Executar no Windows e no Linux](#3-como-executar-no-windows-e-no-linux)
+4. [Como Atualizar o LabDrop](#4-como-atualizar-o-labdrop)
+5. [Como Usar no Dia a Dia](#5-como-usar-no-dia-a-dia)
+6. [Troca de Interface de Rede (Cabo / Wi-Fi) sem Fechar o App](#6-troca-de-interface-de-rede-cabo--wi-fi-sem-fechar-o-app)
+7. [Como Acessar os Arquivos nos Computadores de Destino](#7-como-acessar-os-arquivos-nos-computadores-de-destino)
+8. [Samba no Linux: Quando é Necessário e Como Instalar](#8-samba-no-linux-quando-é-necessário-e-como-instalar)
+9. [Solução de Problemas Comuns (Troubleshooting)](#9-solução-de-problemas-comuns-troubleshooting)
+10. [Segurança e Limpeza Automática](#10-segurança-e-limpeza-automática)
+11. [Para Desenvolvedores (Compilação a partir do Código-Fonte)](#11-para-desenvolvedores-compilação-a-partir-do-código-fonte)
 
+---
+
+## 1. Instalação Rápida (GitHub Releases)
+
+Para instalar ou atualizar o LabDrop, **você não precisa clonar o repositório nem instalar o Rust**. Basta baixar o **Bootstrapper** na página de [**Releases do GitHub**](https://github.com/4mrco/labdrop/releases/latest):
+
+- **No Windows (10/11 x86-64):** baixe **`labdrop-bootstrapper.exe`**
+- **No Linux (Fedora, Ubuntu, Linux Mint x86-64):** baixe **`labdrop-bootstrapper-linux-x86_64.tar.gz`** *(recomendado, pois já vem com permissão de execução)* ou o binário direto **`labdrop-bootstrapper`**.
+
+O Bootstrapper se conecta automaticamente ao GitHub Releases, baixa os dois executáveis oficiais (`LabDrop.exe` para Windows e `labdrop` para Linux), verifica a integridade criptográfica (`SHA-256`) e prepara a estrutura pronta para uso.
+
+---
+
+## 2. Modos de Instalação: Portátil (Pendrive) vs. Local (Computador)
+
+Ao abrir o `labdrop-bootstrapper`, você pode escolher entre dois modos de instalação:
+
+### A. Instalação Portátil (Pendrive USB)
+Ideal para levar no bolso entre diferentes laboratórios. O Bootstrapper cria a pasta `<SeuPendrive>/LabDrop/` contendo **ambos** os executáveis (`LabDrop.exe` e `labdrop`):
 ```text
-LabDrop/
-├── LabDrop.exe          # Windows 10/11 (x86-64) standalone executable
-├── labdrop              # Linux (Fedora, Ubuntu, Linux Mint x86-64) static executable
-├── SHA256SUMS.txt       # Cryptographic SHA-256 digests of both executables
-├── README.txt           # Quick-reference operator instructions
-├── files/               # Optional folder for carrying installers/materials on the USB
-└── config/
-    └── labdrop.toml     # Portable configuration settings
+<Pendrive>/
+└── LabDrop/
+    ├── LabDrop.exe      # Executável nativo para Windows 10/11 (x86-64)
+    ├── labdrop          # Executável estático para Linux (Fedora, Ubuntu, Mint x86-64)
+    ├── files/           # Pasta opcional para guardar seus instaladores/arquivos no pendrive
+    ├── config/          # Configurações portáteis (labdrop.toml)
+    └── SHA256SUMS.txt   # Hashes SHA-256 verificados
+```
+
+### B. Instalação Local (No seu Computador)
+Ideal quando você transmite arquivos sempre a partir do seu próprio notebook ou desktop.
+- Selecione a opção **`[Local PC Install] ~/LabDrop`** na lista do Bootstrapper (ou pressione **`[d]`** para informar qualquer pasta do seu computador).
+- O Bootstrapper instalará o pacote diretamente em `<destino>/LabDrop/` com a mesma estrutura completa e verificada.
+
+> **Nota importante:** O Bootstrapper **nunca formata** seu pendrive ou disco, nunca altera arquivos fora da pasta `LabDrop/`, e instala **apenas** o LabDrop (nunca instala pacotes do sistema como o Samba automaticamente).
+
+---
+
+## 3. Como Executar no Windows e no Linux
+
+### No Windows 10 / 11
+1. Dê dois cliques em **`labdrop-bootstrapper.exe`** para instalar em um pendrive ou pasta local.
+2. Para usar o programa, abra a pasta `LabDrop` criada e dê dois cliques em **`LabDrop.exe`**.
+   - *(Opcional)* Para criar compartilhamentos SMB nativos do Windows na porta 445, clique com o botão direito em `LabDrop.exe` e escolha **Executar como administrador**.
+
+### No Linux (Fedora, Ubuntu, Linux Mint)
+
+#### Opção 1: Usando o arquivo `.tar.gz` (Mais simples)
+O arquivo **`labdrop-bootstrapper-linux-x86_64.tar.gz`** já preserva a permissão de execução (`+x`):
+1. Extraia o arquivo pelo gerenciador de arquivos (ou `tar -xzf labdrop-bootstrapper-linux-x86_64.tar.gz`).
+2. Dê **dois cliques** em `labdrop-bootstrapper` (ele abrirá automaticamente uma janela de terminal com a interface gráfica de texto) ou execute `./labdrop-bootstrapper` no terminal.
+
+#### Opção 2: Usando o binário direto `labdrop-bootstrapper`
+Por padrão de segurança no Linux, navegadores salvam arquivos baixados na pasta `Downloads` **sem permissão de execução** (`rw-rw-r--`). Por isso:
+- Executar `/home/usuario/Downloads/labdrop-bootstrapper` diretamente exibirá `Permission denied` (Permissão negada).
+- Executar `sudo /home/usuario/Downloads/labdrop-bootstrapper` exibirá `sudo: ...: command not found`, porque o `sudo` se recusa a executar um arquivo que não possui o bit executável (`+x`).
+- **Não execute o bootstrapper com `sudo`!** Ele deve rodar com seu usuário normal para que a pasta instalada pertença a você.
+
+Basta conceder permissão de execução uma única vez no terminal:
+```bash
+chmod +x ~/Downloads/labdrop-bootstrapper
+~/Downloads/labdrop-bootstrapper
+```
+Depois de instalado (por exemplo, em `~/LabDrop` ou no pendrive), inicie o LabDrop dando dois cliques no executável **`labdrop`** ou rodando no terminal:
+```bash
+~/LabDrop/labdrop
 ```
 
 ---
 
-## Preparing Your USB Drive (Bootstrapper Usage)
+## 4. Como Atualizar o LabDrop
 
-### 1. Interactive TUI Mode
-Run `./dist/labdrop-bootstrapper` (on Linux) or `dist\labdrop-bootstrapper.exe` (on Windows) with no arguments:
-1. Select your mounted USB drive or target directory (shows available free space).
-2. Choose **Offline Local Release Directory** (`./dist`) or **Online Release Download**.
-3. Press `Enter` to create `LabDrop/`, copy both `LabDrop.exe` and `labdrop`, and verify their SHA-256 checksums and ELF/PE x86-64 headers.
-
-### 2. Command-Line Mode (Offline or Online)
-```bash
-# Offline preparation from locally built release binaries in ./dist:
-./dist/labdrop-bootstrapper --dest /run/media/$USER/USB_DRIVE --source-dir ./dist
-
-# Online preparation from a release server / GitHub Releases URL:
-./dist/labdrop-bootstrapper --dest /run/media/$USER/USB_DRIVE --release-url https://github.com/4mrco/labdrop/releases/latest/download
-```
-
-On Windows PowerShell / Command Prompt:
-```powershell
-.\dist\labdrop-bootstrapper.exe --dest E:\ --source-dir .\dist
-```
+Para atualizar uma instalação existente (no pendrive ou no computador) para uma nova versão:
+1. Execute o **`labdrop-bootstrapper`**.
+2. Selecione o destino marcado como **`[UPDATE LabDrop]`** ou **`[UPDATE Local PC]`** e pressione **`Enter`** (ou clique em **Instalar / Atualizar**).
+3. Os binários `labdrop` e `LabDrop.exe` serão atualizados e verificados via SHA-256, **preservando intactos** todos os seus arquivos dentro de `files/` e suas preferências salvas em `config/labdrop.toml`.
 
 ---
 
-## Running LabDrop in the Laboratory
+## 5. Como Usar no Dia a Dia
 
-### Interactive TUI Workflow (Default)
-1. Plug the USB drive into the transmitting computer.
-2. Launch LabDrop:
-   - **Linux (Fedora / Ubuntu / Linux Mint)**: Run `./labdrop` (or `sudo ./labdrop` if you want standard TCP port 445 SMB for Windows clients).
-     - *Note*: If the USB drive is mounted with `noexec`, copy the binary to `/var/tmp/labdrop`, run `chmod +x /var/tmp/labdrop`, and execute `/var/tmp/labdrop`.
-   - **Windows 10/11**: Double-click `LabDrop.exe` (or right-click -> **Run as administrator** to enable native Windows SMB share creation on port 445).
-3. Select files and folders using **any** of these methods:
-   - Press **`[1] Browse & Select Files / Folders`**: use `F1`–`F4` to jump between USB `files/`, `Downloads`, `Home`, or root drives; press `Space` to select, `Enter` to open a folder, `.` (or `h`) to toggle hidden dotfiles (`.*`, hidden by default).
-   - **Drag & Drop / Paste** files or folders straight onto the terminal (or pass paths as arguments / drag onto `LabDrop.exe` on Windows, or press **`[p]`** to paste paths).
-   - Press **`[o]`** (Native File Picker) or **`[f]`** (Native Folder Picker) to select items via the OS file dialog (`zenity`/`kdialog` on Linux, Windows Explorer dialog on Windows), or **`[x]`** to open the folder in your system file manager.
-   - Press **`[L]`** at any time to switch between **English (`EN`)** and **Português (`PT-BR`)**.
-4. Press **`[3] Configure Network Interface & Protocol`** (optional):
-   - Select the laboratory LAN/Wi-Fi interface to bind to.
-   - Choose `Layered Auto (SMB + WebDAV + HTTP)`, `SMB Only`, `WebDAV Secondary`, or `HTTP Fallback`.
-5. Press **`[4] Stage Files & Start Sharing Session`**:
-   - LabDrop verifies available disk space, copies your selections into internal storage staging, starts the sharing listeners and crash watchdog, and displays the copy-ready access addresses.
-6. On destination computers, open the native file manager:
-   - **Windows 10/11 File Explorer**:
-     - Primary SMB: `\\<IP>\LabDrop`
-     - Secondary WebDAV: `\\<IP>@8080\DavWWWRoot\LabDrop`
-     - Fallback Browser: `http://<IP>:8080/`
-   - **Linux (Fedora / Ubuntu / Linux Mint — Files / Nautilus / Nemo)**:
-     - Primary SMB: `smb://<IP>/LabDrop` (or `smb://<IP>:4445/LabDrop` in rootless mode)
-     - Secondary WebDAV: `dav://<IP>:8080/LabDrop/`
-     - Fallback Browser: `http://<IP>:8080/`
-7. When finished, press **`s`** or **`[5] Stop Sharing & Clean Up Session`**:
-   - Choose whether to **Delete staged files (Recommended)** or **Retain staged files on disk**.
-   - LabDrop stops all listeners, removes only LabDrop-created share definitions and firewall rules, and confirms every cleanup action.
+A interface do LabDrop funciona tanto pelo **teclado** quanto por **cliques do mouse**:
 
-### CLI Subcommands
-LabDrop also supports non-interactive CLI subcommands for scripting and diagnostics:
-```bash
-# Inspect OS, Samba, firewall, network interfaces, and disk space:
-./dist/labdrop doctor
+- **Barra de navegação superior (`[1]` a `[6]`):** mostra sempre em qual tela você está e permite alternar rapidamente entre:
+  - **`[1] Início`**: Visão geral da sessão, resumo do sistema e ações rápidas.
+  - **`[2] Arquivos`**: Navegador integrado de arquivos e pastas (pastas ocultas `.*` ficam ocultas por padrão e podem ser exibidas com `[.]`).
+  - **`[3] Selecionados`**: Lista de revisão dos itens que serão compartilhados.
+  - **`[4] Rede`**: Configuração da interface de rede preferida, protocolo e status do Samba.
+  - **`[5] Compartilhamento`**: Painel da sessão ativa, seletor rápido de interface de rede e controle de reinício do serviço.
+  - **`[6] Diagnóstico`**: Inspeção completa do sistema, firewall e recuperação de sessões órfãs.
+  - **`[L] PT-BR / EN`**: Alterna o idioma da interface entre Português e Inglês a qualquer momento.
 
-# Stage and share selected files/folders from the CLI:
-./dist/labdrop share \
-  --select ./files/installer.exe \
-  --select ~/Downloads/lab-materials \
-  --strategy auto \
-  --http-port 8080
+### Selecionando Arquivos e Pastas
+Você pode adicionar arquivos e pastas de diferentes locais do computador ou do pendrive combinando qualquer um dos métodos abaixo:
+- **Arrastar e Soltar (Drag & Drop):** arraste arquivos ou pastas do gerenciador de arquivos do sistema e solte-os diretamente sobre a janela do terminal do LabDrop.
+- **Seletor Nativo do Sistema:** pressione **`[o]`** (escolher arquivos) ou **`[f]`** (escolher pasta) para abrir a janela nativa do sistema operacional.
+- **Navegador Integrado (`[2] Arquivos`):** navegue com as setas ou roda do mouse, pressione **`Espaço`** (ou clique na caixa `[ ]`) para marcar arquivos/pastas e **`Enter`** para entrar em uma pasta.
 
-# Recover and clean up any orphaned sessions after a power loss:
-./dist/labdrop cleanup
-```
+> **Staging Seguro no Disco Interno:** Ao iniciar o compartilhamento, o LabDrop copia os itens selecionados para uma pasta temporária no armazenamento interno do computador transmissor (`/var/tmp` no Linux ou `%TEMP%` no Windows). Seus arquivos originais nunca são modificados e o pendrive não sofre leitura contínua durante os downloads.
 
 ---
 
-## Building from Source
+## 6. Troca de Interface de Rede (Cabo / Wi-Fi) sem Fechar o App
 
-### Prerequisites (Fedora x86-64 Host)
-- Rust stable toolchain (`rustc` / `cargo`) with targets:
-  - `x86_64-unknown-linux-musl` (for static portable Linux binaries)
-  - `x86_64-pc-windows-gnu` (for Windows x86-64 PE executables)
-- MinGW-w64 GCC toolchain (`x86_64-w64-mingw32-gcc`) for Windows cross-linking
+Um cenário muito comum em laboratório: você abre o LabDrop conectado ao cabo Ethernet, mas depois conecta ao Wi-Fi do laboratório e quer transmitir os arquivos pela rede Wi-Fi sem fechar o aplicativo nem preparar os arquivos de novo.
 
-### Build All Release Binaries
+### Como trocar de interface durante a sessão:
+1. Abra a aba **`[5] Compartilhamento`** (clicando nela ou pressionando `5`).
+2. No painel à direita (**Controles de Interface de Rede e Serviço**), você verá todas as interfaces detectadas com:
+   - Nome da interface (`enp3s0`, `wlp2s0`, `Ethernet`, `Wi-Fi`)
+   - Tipo de conexão (`Ethernet (Cabo)`, `Wi-Fi`, `Virtual`)
+   - Status (`Conectada`)
+   - Endereço IPv4 atribuído e indicação **`[ATIVA]`** na interface em uso no momento.
+3. Se você acabou de conectar o Wi-Fi ou cabo, pressione **`[r]`** (ou clique em **Atualizar Rede**) para recarregar as interfaces.
+4. Selecione a nova interface desejada (com as setas `↑/↓` ou clicando nela com o mouse).
+5. Pressione **`[R]`** (ou clique em **`[R] Reiniciar Serviço`**).
+
+O que o LabDrop faz automaticamente ao reiniciar o serviço:
+- Encerra com segurança os ouvintes antigos, o processo Samba anterior e as regras temporárias de firewall da interface antiga.
+- Reinicia o serviço de compartilhamento na nova interface selecionada reutilizando os arquivos já preparados no staging.
+- Atualiza imediatamente os endereços de acesso exibidos na tela.
+- Exibe um aviso claro informando que conexões de clientes no endereço anterior foram interrompidas.
+
+### Interface Preferida vs. Interface da Sessão Atual
+Na aba **`[4] Rede`**, você pode pressionar **`[f]`** para salvar uma interface como **Interface Preferida (Padrão)** no arquivo `config/labdrop.toml`:
+- **Interface Preferida:** fica salva entre execuções do aplicativo e é selecionada automaticamente quando estiver disponível.
+- **Interface da Sessão Atual:** pode ser alterada livremente a qualquer momento na tela de compartilhamento sem sobrescrever sua preferência padrão.
+- Se a sua interface preferida estiver desconectada ao abrir o LabDrop, o aplicativo seleciona uma interface ativa disponível e exibe um aviso explicando o que aconteceu.
+
+---
+
+## 7. Como Acessar os Arquivos nos Computadores de Destino
+
+Na aba **`[5] Compartilhamento`**, o painel principal mostra de forma limpa os **Endereços Principais de Acesso** (pressione **`[d]`** se quiser expandir todas as instruções passo a passo, URLs secundárias e logs):
+
+| Sistema de Destino | Como Acessar |
+| :--- | :--- |
+| **Windows 10 / 11 (Descoberta Automática)** | Abra o **Explorador de Arquivos -> Rede**. O computador aparecerá automaticamente em *Computadores* ou *Outros Dispositivos* como **`LabDrop (<NomeDoPC>)`**. |
+| **Windows 10 / 11 (Acesso Direto no Explorer)** | Cole na barra de endereços do Explorador de Arquivos o caminho exibido na tela: `\\<IP>\LabDrop` (SMB) ou `\\<IP>@8080\DavWWWRoot\LabDrop` (WebDAV). |
+| **Linux (Fedora, Ubuntu, Linux Mint)** | Abra o gerenciador **Arquivos (Nautilus / Nemo / Dolphin) -> Outros Locais / Rede** e clique em **LabDrop**, ou conecte-se ao servidor `smb://<IP>/LabDrop` ou `dav://<IP>:8080/LabDrop/`. |
+| **Qualquer Navegador Web (Windows / Linux)** | Acesse `http://<IP>:8080/` para baixar arquivos individuais ou clicar em **Download All (.ZIP)** para baixar tudo em um único pacote `.ZIP`. |
+
+---
+
+## 8. Samba no Linux: Quando é Necessário e Como Instalar
+
+O LabDrop usa uma arquitetura em camadas (**SMB + WebDAV RFC 4918 + HTTP + Descoberta SSDP/WSD/mDNS**):
+
+1. **No Windows:** utiliza o servidor SMB nativo do próprio sistema (`LanmanServer`), além de WebDAV e HTTP.
+2. **No Linux:**
+   - **Mesmo sem o Samba instalado**, o LabDrop funciona imediatamente através de **WebDAV nativo + HTTP + Descoberta na Rede**.
+   - Se o **Samba** estiver instalado no Linux transmissor, o LabDrop também ativa o compartilhamento SMB:
+     - **Sem root (Porta 4445):** isolado em user namespace, sem pedir senha de administrador.
+     - **Com `sudo` (Porta 445 padrão):** compatibilidade total com descoberta SMB nativa do Windows Explorer (pressione **`[e]`** na aba `[4] Rede` para reiniciar com `sudo` na porta 445).
+
+### Como verificar e instalar o Samba no Linux
+As abas **`[4] Rede`** e **`[6] Diagnóstico`** mostram claramente se o Samba está instalado e disponível. Caso não esteja instalado e você queira utilizá-lo:
+- Pressione **`[i]`** na aba `[4] Rede` ou `[6] Diagnóstico` para instalar pelo gerenciador de pacotes do sistema, ou execute manualmente:
+  - **Fedora:** `sudo dnf install samba`
+  - **Ubuntu / Linux Mint:** `sudo apt update && sudo apt install samba`
+
+---
+
+## 9. Solução de Problemas Comuns (Troubleshooting)
+
+- **`bash: ./labdrop-bootstrapper: Permission denied` no Linux:**
+  O navegador baixa arquivos sem o atributo executável (`+x`). Rode `chmod +x ~/Downloads/labdrop-bootstrapper` e execute-o novamente **sem `sudo`**. Ou baixe o pacote `labdrop-bootstrapper-linux-x86_64.tar.gz`, que já vem com permissão de execução.
+- **`sudo: /home/.../labdrop-bootstrapper: command not found`:**
+  O comando `sudo` retorna `command not found` quando o arquivo apontado não tem permissão `+x`. Não use `sudo` no bootstrapper; use apenas `chmod +x` e execute com seu usuário normal.
+- **Pendrive montado com `noexec` no Linux:**
+  Algumas distribuições montam pendrives FAT32/NTFS com a trava `noexec`. Nesse caso, instale o LabDrop localmente no PC (`~/LabDrop`) pelo bootstrapper ou copie o binário para `/var/tmp`:
+  ```bash
+  cp /caminho/do/pendrive/LabDrop/labdrop /var/tmp/labdrop && chmod +x /var/tmp/labdrop && /var/tmp/labdrop
+  ```
+- **O computador não aparece automaticamente na aba "Rede" do Windows:**
+  Verifique se o perfil de rede do Windows está definido como **Rede Privada** (redes marcadas como *Públicas* no Windows bloqueiam a descoberta automática WS-Discovery/SSDP) ou se o Wi-Fi da instituição possui isolamento de clientes (AP Isolation). Nesses casos, cole o endereço direto exibido na tela (`\\<IP>@8080\DavWWWRoot\LabDrop` ou `http://<IP>:8080/`).
+
+---
+
+## 10. Segurança e Limpeza Automática
+
+- **Somente-Leitura e Temporário:** Todos os protocolos (SMB, WebDAV e HTTP) expõem apenas a pasta temporária de staging em modo **somente-leitura (read-only)** e bloqueiam qualquer tentativa de navegação fora dela (`..`).
+- **Acesso Sem Senha na Rede Selecionada:** Durante uma sessão ativa, qualquer computador conectado à mesma sub-rede da interface selecionada pode ler os arquivos compartilhados. Não compartilhe documentos confidenciais em redes públicas.
+- **Limpeza Garantida ao Sair ou Fechar o Terminal:** Ao parar a sessão (`[s]`) ou fechar a janela do terminal, o LabDrop encerra todos os processos filhos (`smbd`, `smbd-notifyd`, `smbd-cleanupd`, WebDAV/HTTP), remove as regras temporárias de firewall e apaga os arquivos temporários de staging — garantindo que o pendrive nunca fique preso ao tentar ejetar.
+
+---
+
+## 11. Para Desenvolvedores (Compilação a partir do Código-Fonte)
+
+Se você deseja modificar o código-fonte do LabDrop ou compilar os binários manualmente:
+
+### Pré-requisitos de Compilação
+- Rust (`stable`) com os alvos `x86_64-unknown-linux-musl` e `x86_64-pc-windows-gnu` (ou `x86_64-pc-windows-msvc` no Windows).
+- No Fedora Linux: `sudo dnf install mingw64-gcc samba samba-client`
+- No Ubuntu / Mint: `sudo apt install musl-tools gcc-mingw-w64-x86-64 samba smbclient`
+
+### Comandos Principais
 ```bash
-./scripts/build-release.sh
-```
-This produces in `./dist/`:
-- `dist/labdrop` (Linux x86-64 static ELF executable)
-- `dist/LabDrop.exe` (Windows x86-64 PE32+ executable)
-- `dist/labdrop-bootstrapper` (Linux x86-64 static ELF executable)
-- `dist/labdrop-bootstrapper.exe` (Windows x86-64 PE32+ executable)
-- `dist/SHA256SUMS.txt`
-
-### Run Automated & Cross-Platform Tests
-```bash
-# Run Rust unit and integration tests:
+# Executar a suíte de testes unitários e de integração
 cargo test --workspace
 
-# Run cross-platform verification suite (Fedora host, Debian/Ubuntu container, Wine Windows PE, and SIGKILL watchdog):
+# Construir todos os binários de release (Linux estático MUSL + Windows PE x86-64 + .tar.gz + SHA256SUMS.txt) em ./dist/
+./scripts/build-release.sh
+
+# Executar a suíte completa de verificação multiplataforma e recuperação de falhas
 ./scripts/run-cross-tests.sh
 ```

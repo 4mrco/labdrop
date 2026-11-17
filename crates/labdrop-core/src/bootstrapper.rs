@@ -160,23 +160,58 @@ pub fn discover_candidate_destinations() -> Vec<CandidateDestination> {
         }
     }
 
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home_path = PathBuf::from(&home);
+        if home_path.is_dir() {
+            let local_install = home_path.join("LabDrop");
+            if seen.insert(local_install.clone()) {
+                if let Ok(space) = query_disk_space(&home_path) {
+                    let has_existing = dir_has_existing_labdrop(&local_install);
+                    let tag = if has_existing {
+                        "[UPDATE Local PC]"
+                    } else {
+                        "[Local PC Install]"
+                    };
+                    candidates.push(CandidateDestination {
+                        label: format!(
+                            "{tag} {} ({} free)",
+                            local_install.display(),
+                            format_bytes(space.available_bytes)
+                        ),
+                        path: local_install,
+                        available_bytes: space.available_bytes,
+                        has_existing_labdrop: has_existing,
+                    });
+                }
+            }
+        }
+    }
+
     if let Ok(cwd) = std::env::current_dir() {
-        let usb_out = cwd.join("usb_ready");
-        if seen.insert(usb_out.clone()) {
+        let cwd_is_labdrop = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("LabDrop"))
+            .unwrap_or(false);
+        let local_dir = if cwd_is_labdrop {
+            cwd.clone()
+        } else {
+            cwd.join("LabDrop")
+        };
+        if seen.insert(local_dir.clone()) {
             if let Ok(space) = query_disk_space(&cwd) {
-                let has_existing = dir_has_existing_labdrop(&usb_out);
+                let has_existing = dir_has_existing_labdrop(&local_dir);
                 let tag = if has_existing {
-                    "[UPDATE Local]"
+                    "[UPDATE Folder]"
                 } else {
                     "[Local Folder]"
                 };
                 candidates.push(CandidateDestination {
                     label: format!(
                         "{tag} {} ({} free)",
-                        usb_out.display(),
+                        local_dir.display(),
                         format_bytes(space.available_bytes)
                     ),
-                    path: usb_out,
+                    path: local_dir,
                     available_bytes: space.available_bytes,
                     has_existing_labdrop: has_existing,
                 });
@@ -426,10 +461,11 @@ where
     let config_file = config_dir.join("labdrop.toml");
     if !config_file.exists() {
         let default_cfg = "\
-# LabDrop Portable Configuration
+# LabDrop Configuration
 # Place installers or classroom files inside the '../files/' directory for quick access.
 
 language = \"auto\" # \"auto\", \"en\", or \"pt\"
+preferred_interface = \"auto\" # Interface name (e.g. \"wlp2s0\", \"eth0\") or \"auto\"
 default_protocol = \"auto\"
 preferred_http_port = 8080
 preferred_rootless_smb_port = 4445
@@ -900,5 +936,36 @@ mod tests {
         assert_ne!(rep1.windows_binary_sha256, rep2.windows_binary_sha256);
         assert_eq!(fs::read(&carrier_file).unwrap(), b"classroom material");
         assert_eq!(fs::read(&custom_cfg).unwrap(), b"language = \"pt\"\n");
+    }
+
+    #[test]
+    fn bootstrapper_candidates_exclude_usb_ready_and_support_local_install_dir() {
+        let candidates = discover_candidate_destinations();
+        assert!(!candidates.is_empty());
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.path.to_string_lossy().contains("usb_ready")),
+            "discover_candidate_destinations must not use hardcoded usb_ready folder"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("labdrop"), make_synthetic_elf_x86_64()).unwrap();
+        fs::write(src_dir.join("LabDrop.exe"), make_synthetic_pe_x86_64()).unwrap();
+
+        // Local installation when destination already ends with "LabDrop"
+        let local_target = tmp.path().join("LabDrop");
+        let rep = prepare_usb_package(
+            &local_target,
+            &ArtifactSource::LocalDirectory(src_dir),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(rep.labdrop_dir, local_target);
+        assert!(local_target.join("labdrop").is_file());
+        assert!(local_target.join("LabDrop.exe").is_file());
+        assert!(!local_target.join("LabDrop").exists());
     }
 }

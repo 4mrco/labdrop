@@ -1,4 +1,5 @@
 pub mod bootstrapper;
+pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod fs_space;

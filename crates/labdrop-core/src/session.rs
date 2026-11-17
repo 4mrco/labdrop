@@ -1,6 +1,7 @@
 use crate::discovery::{DiscoveryConfig, NetworkDiscovery};
 use crate::error::{LabDropError, Result};
 use crate::http_webdav::{EmbeddedFileServer, EmbeddedServerMode};
+use crate::i18n::Lang;
 use crate::network::{get_local_hostname, MdnsAdvertiser, MdnsServiceSpec, NetworkInterface};
 use crate::smb::{
     cleanup_smb_record, kill_pid_gracefully, start_smb_share, ActiveSmbShare, SmbCleanupRecord,
@@ -33,11 +34,27 @@ pub enum SharingStrategy {
 
 impl SharingStrategy {
     pub fn display_name(&self) -> &'static str {
-        match self {
-            SharingStrategy::AutoLayered => "Layered (SMB Primary + WebDAV Secondary + HTTP Fallback)",
-            SharingStrategy::SmbOnly => "SMB Only (Samba / Windows Native SMB)",
-            SharingStrategy::WebDavSecondary => "WebDAV Secondary (RFC 4918 Native File Manager + HTTP)",
-            SharingStrategy::HttpFallback => "HTTP Fallback Only (Browser + .ZIP Stream)",
+        self.display_name_localized(Lang::En)
+    }
+
+    pub fn display_name_localized(&self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (SharingStrategy::AutoLayered, Lang::En) => {
+                "Auto Layered (SMB + WebDAV + HTTP)"
+            }
+            (SharingStrategy::AutoLayered, Lang::PtBr) => {
+                "Automático em Camadas (SMB + WebDAV + HTTP)"
+            }
+            (SharingStrategy::SmbOnly, Lang::En) => "SMB Only (Samba / Windows Native SMB)",
+            (SharingStrategy::SmbOnly, Lang::PtBr) => "Apenas SMB (Samba / SMB Nativo Windows)",
+            (SharingStrategy::WebDavSecondary, Lang::En) => {
+                "WebDAV + HTTP (Native File Manager without Root)"
+            }
+            (SharingStrategy::WebDavSecondary, Lang::PtBr) => {
+                "WebDAV + HTTP (Gerenciador Nativo sem Root)"
+            }
+            (SharingStrategy::HttpFallback, Lang::En) => "HTTP Browser Only (Browser + .ZIP)",
+            (SharingStrategy::HttpFallback, Lang::PtBr) => "Apenas Navegador HTTP (Browser + .ZIP)",
         }
     }
 }
@@ -426,6 +443,69 @@ impl ActiveSharingSession {
 
         report
     }
+
+    /// Cleanly stops all active network listeners, SMB shares, and temporary firewall rules
+    /// while preserving `staged_dir` and `manifest`, then restarts the sharing service on
+    /// `new_iface` (and/or with updated `strategy` / `linux_smb_mode`).
+    ///
+    /// Guarantees that:
+    /// - Old listeners and bindings are stopped before rebinding.
+    /// - Old temporary firewall rules and SMB share definitions are cleaned up.
+    /// - If starting on `new_iface` fails, no stale services or duplicate shares remain running.
+    pub fn restart_on_interface(
+        &mut self,
+        new_iface: &NetworkInterface,
+        strategy: SharingStrategy,
+        linux_smb_mode: Option<SmbLinuxMode>,
+        preferred_http_port: u16,
+        spawn_watchdog: bool,
+    ) -> Result<CleanupReport> {
+        let old_iface_name = self.ledger.interface_name.clone();
+        let old_iface_ip = self.ledger.interface_ip.clone();
+        let manifest = self.manifest.clone();
+        let session_dir = self.ledger.session_dir.clone();
+
+        // 1. Stop current services while retaining staged_dir (`delete_staged_files = false`)
+        let cleanup_report = self.stop_and_cleanup(false);
+
+        // 2. Start a new session on `new_iface` reusing the existing `manifest` and `session_dir`
+        let mut new_session = Self::start(
+            manifest,
+            session_dir,
+            new_iface,
+            strategy,
+            linux_smb_mode,
+            preferred_http_port,
+            spawn_watchdog,
+        )?;
+
+        if old_iface_name != new_iface.name || old_iface_ip != new_iface.ipv4.to_string() {
+            new_session.ledger.warnings.insert(
+                0,
+                format!(
+                    "Sharing service switched from {} ({}) to {} ({}). Any clients connected to {} were disconnected and must use the updated address.",
+                    old_iface_name, old_iface_ip, new_iface.name, new_iface.ipv4, old_iface_ip
+                ),
+            );
+        } else {
+            new_session.ledger.warnings.insert(
+                0,
+                format!(
+                    "Sharing service restarted on {} ({}). Active client connections may have been briefly interrupted.",
+                    new_iface.name, new_iface.ipv4
+                ),
+            );
+        }
+
+        // Update persisted ledger with the restart notice
+        if let Ok(ledger_json) = serde_json::to_string_pretty(&new_session.ledger) {
+            let _ = fs::write(new_session.ledger.session_dir.join("session.json"), &ledger_json);
+            let _ = fs::write(&new_session.ledger.registry_file, &ledger_json);
+        }
+
+        *self = new_session;
+        Ok(cleanup_report)
+    }
 }
 
 impl Drop for ActiveSharingSession {
@@ -570,6 +650,79 @@ pub fn is_terminal_disconnected() -> bool {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(libc::STDIN_FILENO, &mut st) } == 0 && st.st_nlink == 0 {
             return true;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// When `labdrop` or `labdrop-bootstrapper` is launched on a Linux desktop by double-clicking in a
+/// file manager (Dolphin, Nautilus, Nemo, Thunar), `stdin` is not a TTY (`isatty(0) == 0`).
+/// This helper detects that scenario and automatically re-launches the binary inside an available
+/// desktop terminal emulator so the interactive TUI opens in a visible window.
+/// Returns `true` if a terminal emulator was spawned (meaning the current headless process should exit `Ok(())`).
+pub fn ensure_interactive_terminal_on_linux() -> bool {
+    #[cfg(unix)]
+    {
+        let stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        let stdout_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
+        if stdin_tty && stdout_tty {
+            return false;
+        }
+        if std::env::var_os("LABDROP_TERMINAL_RELAUNCH").is_some()
+            || std::env::var_os("CARGO").is_some()
+            || std::env::var_os("RUST_TEST_THREADS").is_some()
+        {
+            return false;
+        }
+        let has_gui = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if !has_gui {
+            return false;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let extra_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let cwd = exe
+            .parent()
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(std::env::temp_dir);
+
+        // Candidate desktop terminal emulators and the flag used before the command
+        let terminals: &[(&str, &[&str])] = &[
+            ("ptyxis", &["--"]),
+            ("kgx", &["-e"]),
+            ("gnome-terminal", &["--"]),
+            ("konsole", &["-e"]),
+            ("xfce4-terminal", &["-x"]),
+            ("mate-terminal", &["-x"]),
+            ("tilix", &["-e"]),
+            ("alacritty", &["-e"]),
+            ("kitty", &[]),
+            ("wezterm", &["start", "--"]),
+            ("foot", &[]),
+            ("x-terminal-emulator", &["-e"]),
+            ("xterm", &["-e"]),
+        ];
+
+        for (term_bin, flag_args) in terminals {
+            let mut cmd = Command::new(term_bin);
+            cmd.args(*flag_args)
+                .arg(&exe)
+                .args(&extra_args)
+                .current_dir(&cwd)
+                .env("LABDROP_TERMINAL_RELAUNCH", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if cmd.spawn().is_ok() {
+                return true;
+            }
         }
         false
     }
@@ -732,5 +885,85 @@ mod tests {
         assert!(reports[0].staged_files_deleted);
         assert!(!sess_dir.exists());
         assert!(!reg_file.exists());
+    }
+
+    #[test]
+    fn restart_on_interface_stops_old_listener_preserves_staged_files_and_binds_new_interface() {
+        use crate::staging::{stage_selection, SelectionSet};
+        use std::net::{Ipv4Addr, TcpStream};
+
+        let tmp = TempDir::new().unwrap();
+        let src_file = tmp.path().join("installer.bin");
+        fs::write(&src_file, b"labdrop-switch-interface-payload").unwrap();
+
+        let mut sel = SelectionSet::new();
+        sel.add_path(&src_file).unwrap();
+
+        let session_dir = tmp.path().join("sess-switch");
+        let staged_dir = session_dir.join("staged");
+        let manifest = stage_selection("sess-switch", &sel, &staged_dir, None, None, |_| {}).unwrap();
+
+        let iface_eth = NetworkInterface {
+            name: "eth0".to_string(),
+            ipv4: Ipv4Addr::LOCALHOST,
+            prefix_len: 8,
+            subnet_cidr: "127.0.0.0/8".to_string(),
+            is_loopback: true,
+            is_wireless: false,
+            is_virtual: false,
+            is_default_route: true,
+        };
+
+        let mut sess = ActiveSharingSession::start(
+            manifest,
+            session_dir,
+            &iface_eth,
+            SharingStrategy::WebDavSecondary,
+            None,
+            0,
+            false,
+        )
+        .unwrap();
+
+        let old_port = sess.embedded_server.as_ref().unwrap().port;
+        assert!(TcpStream::connect(("127.0.0.1", old_port)).is_ok());
+
+        // Simulate switching to Wi-Fi interface and restarting the sharing service
+        let iface_wifi = NetworkInterface {
+            name: "wlan0".to_string(),
+            ipv4: Ipv4Addr::LOCALHOST,
+            prefix_len: 8,
+            subnet_cidr: "127.0.0.0/8".to_string(),
+            is_loopback: true,
+            is_wireless: true,
+            is_virtual: false,
+            is_default_route: false,
+        };
+
+        let cleanup_rep = sess
+            .restart_on_interface(
+                &iface_wifi,
+                SharingStrategy::WebDavSecondary,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+
+        assert!(!cleanup_rep.staged_files_deleted);
+        assert!(staged_dir.join("installer.bin").is_file());
+        assert_eq!(sess.ledger.interface_name, "wlan0");
+        assert!(sess
+            .ledger
+            .warnings
+            .iter()
+            .any(|w| w.contains("eth0") && w.contains("wlan0")));
+
+        let new_port = sess.embedded_server.as_ref().unwrap().port;
+        assert!(TcpStream::connect(("127.0.0.1", new_port)).is_ok());
+
+        let final_rep = sess.stop_and_cleanup(true);
+        assert!(final_rep.staged_files_deleted);
+        assert!(!staged_dir.exists());
     }
 }

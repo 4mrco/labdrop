@@ -1,3 +1,4 @@
+use crate::i18n::Lang;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::process::{Child, Command, Stdio};
@@ -19,6 +20,44 @@ pub struct NetworkInterface {
 }
 
 impl NetworkInterface {
+    pub fn connection_type_label(&self, lang: Lang) -> &'static str {
+        if self.is_loopback {
+            match lang {
+                Lang::En => "Loopback",
+                Lang::PtBr => "Loopback (Local)",
+            }
+        } else if self.is_wireless {
+            match lang {
+                Lang::En => "Wi-Fi",
+                Lang::PtBr => "Wi-Fi",
+            }
+        } else if self.is_virtual {
+            match lang {
+                Lang::En => "Virtual / Bridge",
+                Lang::PtBr => "Virtual / Bridge",
+            }
+        } else {
+            match lang {
+                Lang::En => "Ethernet",
+                Lang::PtBr => "Ethernet (Cabo)",
+            }
+        }
+    }
+
+    pub fn connection_status_label(&self, lang: Lang) -> &'static str {
+        if self.is_loopback {
+            match lang {
+                Lang::En => "Local Only",
+                Lang::PtBr => "Apenas Local",
+            }
+        } else {
+            match lang {
+                Lang::En => "Connected",
+                Lang::PtBr => "Conectada",
+            }
+        }
+    }
+
     pub fn display_label(&self) -> String {
         let kind = if self.is_loopback {
             "Loopback"
@@ -39,6 +78,81 @@ impl NetworkInterface {
             self.name, self.ipv4, self.prefix_len, kind, def
         )
     }
+
+    /// Formats a clean, informative row for the TUI interface selector showing:
+    /// interface name, connection type, connection status, assigned IPv4, and active/preferred badges.
+    pub fn selector_row_label(
+        &self,
+        lang: Lang,
+        is_preferred: bool,
+        is_active_sharing: bool,
+    ) -> String {
+        let kind = self.connection_type_label(lang);
+        let status = self.connection_status_label(lang);
+        let mut badges = Vec::new();
+        if is_active_sharing {
+            badges.push(match lang {
+                Lang::En => "[SHARING ACTIVE]",
+                Lang::PtBr => "[EM USO NO COMPARTILHAMENTO]",
+            });
+        }
+        if is_preferred {
+            badges.push(match lang {
+                Lang::En => "[Preferred]",
+                Lang::PtBr => "[Preferida]",
+            });
+        }
+        if self.is_default_route && !is_preferred {
+            badges.push(match lang {
+                Lang::En => "[Default Route]",
+                Lang::PtBr => "[Rota Padrão]",
+            });
+        }
+        let badge_str = if badges.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", badges.join(" "))
+        };
+        format!(
+            "{:<12} {:<16} {:<12} {}/{}{}",
+            self.name, kind, status, self.ipv4, self.prefix_len, badge_str
+        )
+    }
+}
+
+/// Resolves which network interface index to select given the discovered interfaces and
+/// an optional persisted `preferred_interface` name.
+/// If the preferred interface is currently unavailable/disconnected, falls back gracefully to
+/// index `0` and returns a localized explanation message.
+pub fn resolve_preferred_interface(
+    interfaces: &[NetworkInterface],
+    preferred_name: Option<&str>,
+    lang: Lang,
+) -> (usize, Option<String>) {
+    if interfaces.is_empty() {
+        return (0, None);
+    }
+    if let Some(pref) = preferred_name.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto")) {
+        if let Some(idx) = interfaces
+            .iter()
+            .position(|i| i.name.eq_ignore_ascii_case(pref) || i.ipv4.to_string() == pref)
+        {
+            return (idx, None);
+        }
+        let fallback = &interfaces[0];
+        let msg = match lang {
+            Lang::En => format!(
+                "Preferred network interface '{}' is currently unavailable/disconnected; using '{}' ({}) for this session.",
+                pref, fallback.name, fallback.ipv4
+            ),
+            Lang::PtBr => format!(
+                "A interface preferida '{}' não está disponível/conectada no momento; usando '{}' ({}) nesta sessão.",
+                pref, fallback.name, fallback.ipv4
+            ),
+        };
+        return (0, Some(msg));
+    }
+    (0, None)
 }
 
 /// Computes the network CIDR string (e.g. `192.168.18.0/24`) from an IPv4 address and prefix length.
