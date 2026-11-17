@@ -1,0 +1,13 @@
+# Canonically local Single Source of Truth
+PROJECT_STATE.md
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Temporary staging & test artifacts
+/tmp_staging/
+/test_output/
+/.labdrop-test/
+/dist/
+/usb_package_test/
