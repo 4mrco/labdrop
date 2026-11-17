@@ -478,6 +478,33 @@ pub fn recover_orphaned_sessions(custom_base_dir: Option<&Path>) -> Vec<CleanupR
     reports
 }
 
+/// Checks whether standard input (the controlling terminal / PTY) has been closed or disconnected.
+/// Used by TUI event loops to exit cleanly and tear down Samba/WebDAV/HTTP when a terminal window
+/// closes without delivering `SIGHUP`.
+pub fn is_terminal_disconnected() -> bool {
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+            return true;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(libc::STDIN_FILENO, &mut st) } == 0 && st.st_nlink == 0 {
+            return true;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Checks if a process with `pid` is currently alive on the host OS.
 pub fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {

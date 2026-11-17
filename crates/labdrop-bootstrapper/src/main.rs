@@ -15,6 +15,7 @@ use labdrop_core::{
     },
     fs_space::{format_bytes, query_disk_space},
     i18n::Lang,
+    session::is_terminal_disconnected,
     staging::parse_dropped_paths,
 };
 use ratatui::{
@@ -28,6 +29,8 @@ use ratatui::{
 use std::{
     io::{self, Stdout},
     path::PathBuf,
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
@@ -192,13 +195,17 @@ fn run_bootstrapper_tui(
 
     let res = run_loop(&mut terminal, &mut app);
 
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
+    if is_terminal_disconnected() {
+        std::mem::forget(terminal);
+    } else {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = terminal.show_cursor();
+    }
 
     res
 }
@@ -234,25 +241,48 @@ fn add_or_select_custom_dest(app: &mut BootstrapperTuiApp, path: PathBuf) {
     app.selected_idx = 0;
 }
 
+fn spawn_input_reader() -> mpsc::Receiver<Event> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || loop {
+        if is_terminal_disconnected() {
+            break;
+        }
+        match event::read() {
+            Ok(ev) => {
+                if tx.send(ev).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+    rx
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut BootstrapperTuiApp,
 ) -> Result<()> {
+    let rx = spawn_input_reader();
     while !app.should_quit {
-        terminal.draw(|f| draw_bootstrapper_ui(f, app))?;
+        if is_terminal_disconnected() {
+            break;
+        }
+        if terminal.draw(|f| draw_bootstrapper_ui(f, app)).is_err() {
+            break;
+        }
 
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Paste(text) => {
-                    if app.modal != InputModal::None {
-                        app.modal_buffer.push_str(text.trim());
-                    } else if let Some(first_path) = parse_dropped_paths(&text).into_iter().next() {
-                        if first_path.is_dir() {
-                            add_or_select_custom_dest(app, first_path);
-                        }
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(Event::Paste(text)) => {
+                if app.modal != InputModal::None {
+                    app.modal_buffer.push_str(text.trim());
+                } else if let Some(first_path) = parse_dropped_paths(&text).into_iter().next() {
+                    if first_path.is_dir() {
+                        add_or_select_custom_dest(app, first_path);
                     }
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+            }
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
@@ -357,9 +387,10 @@ fn run_loop(
                         }
                         _ => {}
                     }
-                }
-                _ => {}
             }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())

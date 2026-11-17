@@ -12,7 +12,8 @@ use labdrop_core::{
     i18n::Lang,
     network::{discover_network_interfaces, NetworkInterface},
     session::{
-        recover_orphaned_sessions, ActiveSharingSession, CleanupReport, SharingStrategy,
+        is_terminal_disconnected, recover_orphaned_sessions, ActiveSharingSession, CleanupReport,
+        SharingStrategy,
     },
     smb::{
         install_linux_samba_interactive, probe_smb_environment, SmbEnvironmentStatus, SmbLinuxMode,
@@ -32,7 +33,11 @@ use std::{
     io::{self, Stdout},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -387,7 +392,7 @@ impl LabDropTuiApp {
             &self.selection,
             &staged_dir,
             None,
-            None,
+            Some(&TUI_TERMINATION_REQUESTED),
             |prog| {
                 let _ = terminal.draw(|f| {
                     render_staging_progress_modal(
@@ -651,45 +656,74 @@ pub fn run_tui(lang: Lang, initial_paths: Vec<PathBuf>) -> Result<()> {
         let _ = sess.stop_and_cleanup(true);
     }
 
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
+    if is_terminal_disconnected() {
+        // Terminal/PTY is already closed; skip ratatui::Terminal::drop eprintln! on closed stderr
+        std::mem::forget(terminal);
+    } else {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = terminal.show_cursor();
+    }
 
     res
+}
+
+fn spawn_input_reader() -> mpsc::Receiver<Event> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || loop {
+        if TUI_TERMINATION_REQUESTED.load(Ordering::Relaxed) || is_terminal_disconnected() {
+            break;
+        }
+        match event::read() {
+            Ok(ev) => {
+                if tx.send(ev).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+    rx
 }
 
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut LabDropTuiApp,
 ) -> Result<()> {
+    let rx = spawn_input_reader();
     while !app.should_quit && !TUI_TERMINATION_REQUESTED.load(Ordering::Relaxed) {
-        terminal.draw(|f| draw_ui(f, app))?;
+        if is_terminal_disconnected() {
+            TUI_TERMINATION_REQUESTED.store(true, Ordering::Relaxed);
+            break;
+        }
+        if terminal.draw(|f| draw_ui(f, app)).is_err() {
+            break;
+        }
 
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
-                Event::Paste(text) => {
-                    if app.screen == Screen::PastePathModal {
-                        app.paste_buffer.push_str(&text);
-                    } else {
-                        app.add_dropped_text(&text);
-                    }
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(Event::Paste(text)) => {
+                if app.screen == Screen::PastePathModal {
+                    app.paste_buffer.push_str(&text);
+                } else {
+                    app.add_dropped_text(&text);
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Ctrl+C anywhere initiates clean shutdown
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        app.should_quit = true;
-                        continue;
-                    }
-                    handle_key_press(terminal, app, key.code)?;
-                }
-                _ => {}
             }
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                // Ctrl+C anywhere initiates clean shutdown
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+                {
+                    app.should_quit = true;
+                    continue;
+                }
+                handle_key_press(terminal, app, key.code)?;
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
