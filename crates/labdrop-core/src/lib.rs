@@ -1,4 +1,5 @@
 pub mod bootstrapper;
+pub mod discovery;
 pub mod error;
 pub mod fs_space;
 pub mod http_webdav;

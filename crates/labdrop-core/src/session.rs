@@ -1,6 +1,7 @@
+use crate::discovery::{DiscoveryConfig, NetworkDiscovery};
 use crate::error::{LabDropError, Result};
 use crate::http_webdav::{EmbeddedFileServer, EmbeddedServerMode};
-use crate::network::{MdnsAdvertiser, NetworkInterface};
+use crate::network::{get_local_hostname, MdnsAdvertiser, MdnsServiceSpec, NetworkInterface};
 use crate::smb::{
     cleanup_smb_record, kill_pid_gracefully, start_smb_share, ActiveSmbShare, SmbCleanupRecord,
     SmbLinuxMode,
@@ -85,6 +86,7 @@ pub struct ActiveSharingSession {
     smb_share: Option<ActiveSmbShare>,
     embedded_server: Option<EmbeddedFileServer>,
     mdns: Option<MdnsAdvertiser>,
+    discovery: Option<NetworkDiscovery>,
     watchdog_stdin: Option<ChildStdin>,
     watchdog_child: Option<Child>,
     cleaned_up: bool,
@@ -188,16 +190,32 @@ impl ActiveSharingSession {
             SharingStrategy::SmbOnly => None,
         };
 
+        let (short_host, mdns_host) = get_local_hostname();
+        let mut discovery_cfg = DiscoveryConfig {
+            session_id: session_id.clone(),
+            device_uuid: DiscoveryConfig::deterministic_uuid(&session_id),
+            hostname: short_host.clone(),
+            interface_ip: iface.ipv4,
+            http_port: None,
+            smb_port: smb_share.as_ref().map(|s| s.port),
+            webdav_enabled: matches!(
+                strategy,
+                SharingStrategy::AutoLayered | SharingStrategy::WebDavSecondary
+            ),
+        };
+
         if let Some(srv_mode) = server_mode_opt {
-            let srv = EmbeddedFileServer::start(
+            let srv = EmbeddedFileServer::start_with_discovery(
                 iface.ipv4,
                 preferred_http_port,
                 srv_mode,
                 staged_dir.clone(),
                 Some(manifest.clone()),
                 Arc::clone(&tracker),
+                Some(discovery_cfg.clone()),
             )?;
             let port = srv.port;
+            discovery_cfg.http_port = Some(port);
 
             if srv_mode == EmbeddedServerMode::WebDavAndHttp {
                 active_protocols.push(format!("WebDAV RFC 4918 (Port {port})"));
@@ -222,7 +240,6 @@ impl ActiveSharingSession {
             }
 
             active_protocols.push(format!("HTTP Fallback (Port {port})"));
-            let (_, mdns_host) = crate::network::get_local_hostname();
             endpoints.push(AccessEndpoint {
                 protocol: "HTTP (Fallback)".to_string(),
                 target_os: "Any Web Browser (Direct IP)".to_string(),
@@ -239,20 +256,73 @@ impl ActiveSharingSession {
             embedded_server = Some(srv);
         }
 
-        // 3. Start mDNS / Avahi advertiser for discovery
-        let mdns_port = embedded_server
-            .as_ref()
-            .map(|s| s.port)
-            .or_else(|| smb_share.as_ref().map(|s| s.port))
-            .unwrap_or(8080);
-        let mdns_type = if embedded_server.is_some() {
-            "_http._tcp"
-        } else {
-            "_smb._tcp"
-        };
-        let mdns = MdnsAdvertiser::start(iface.ipv4, mdns_port, mdns_type);
-        if let Some(avahi_pid) = mdns.avahi_pid() {
+        // 3. Start multi-protocol mDNS/Avahi DNS-SD + Windows SSDP/WSD/LLMNR Discovery
+        let mut mdns_services = Vec::new();
+        if let Some(ref smb) = smb_share {
+            mdns_services.push(MdnsServiceSpec {
+                service_type: "_smb._tcp".to_string(),
+                port: smb.port,
+                txt_path: format!("/{}", smb.share_name),
+            });
+        }
+        if let Some(ref srv) = embedded_server {
+            if srv.mode == EmbeddedServerMode::WebDavAndHttp {
+                mdns_services.push(MdnsServiceSpec {
+                    service_type: "_webdav._tcp".to_string(),
+                    port: srv.port,
+                    txt_path: "/LabDrop/".to_string(),
+                });
+            }
+            mdns_services.push(MdnsServiceSpec {
+                service_type: "_http._tcp".to_string(),
+                port: srv.port,
+                txt_path: "/".to_string(),
+            });
+        }
+
+        let mdns = MdnsAdvertiser::start_services(iface.ipv4, &mdns_services);
+        for avahi_pid in mdns.avahi_pids() {
             child_pids.push(avahi_pid);
+        }
+
+        let discovery = if !iface.ipv4.is_loopback() {
+            let disc = NetworkDiscovery::start(discovery_cfg);
+            if disc.ssdp_active {
+                active_protocols.push("Windows Network Discovery (SSDP/UPnP)".to_string());
+                endpoints.insert(
+                    0,
+                    AccessEndpoint {
+                        protocol: "Auto-Discovery (Win)".to_string(),
+                        target_os: "Windows 10/11 Explorer -> Network".to_string(),
+                        address: format!("LabDrop ({short_host})"),
+                        instructions: "Open File Explorer -> Network -> double-click under Other Devices (no IP needed)".to_string(),
+                    },
+                );
+            }
+            if disc.wsd_active {
+                active_protocols.push("Windows Network Computers (WS-Discovery)".to_string());
+                endpoints.insert(
+                    0,
+                    AccessEndpoint {
+                        protocol: "Auto-Discovery (WSD)".to_string(),
+                        target_os: "Windows 10/11 Explorer -> Network".to_string(),
+                        address: format!("\\\\{}", short_host.to_uppercase()),
+                        instructions: "Open File Explorer -> Network -> Computers -> double-click host".to_string(),
+                    },
+                );
+            }
+            Some(disc)
+        } else {
+            None
+        };
+
+        if !mdns_services.is_empty() {
+            endpoints.push(AccessEndpoint {
+                protocol: "Auto-Discovery (Linux)".to_string(),
+                target_os: "Linux Files / Nautilus / Nemo".to_string(),
+                address: format!("Network -> LabDrop ({short_host})"),
+                instructions: "Open Files -> Other Locations -> click LabDrop SMB or WebDAV".to_string(),
+            });
         }
 
         let ledger = SessionLedger {
@@ -303,6 +373,7 @@ impl ActiveSharingSession {
             smb_share,
             embedded_server,
             mdns: Some(mdns),
+            discovery,
             watchdog_stdin,
             watchdog_child,
             cleaned_up: false,
@@ -329,7 +400,10 @@ impl ActiveSharingSession {
         let _ = fs::remove_file(&self.ledger.registry_file);
         let _ = fs::remove_file(self.ledger.session_dir.join("session.json"));
 
-        // Stop in-process servers and monitors
+        // Stop in-process servers and discovery responders (sending SSDP byebye & WSD Bye)
+        if let Some(mut disc) = self.discovery.take() {
+            disc.stop();
+        }
         if let Some(mut srv) = self.embedded_server.take() {
             srv.stop();
         }

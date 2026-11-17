@@ -1887,7 +1887,7 @@ fn draw_active_session(f: &mut Frame, app: &LabDropTuiApp, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(13), Constraint::Min(8)])
+        .constraints([Constraint::Percentage(62), Constraint::Min(7)])
         .split(area);
 
     let mut top_lines = vec![

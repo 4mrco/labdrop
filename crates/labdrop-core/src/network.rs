@@ -4,7 +4,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 /// Represents a discovered IPv4 network interface on the transmitting computer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,87 +354,117 @@ pub fn get_local_hostname() -> (String, String) {
     (short, mdns)
 }
 
+/// Service descriptor advertised via Avahi / mDNS DNS-SD.
+#[derive(Debug, Clone)]
+pub struct MdnsServiceSpec {
+    pub service_type: String,
+    pub port: u16,
+    pub txt_path: String,
+}
+
 /// Manages optional mDNS / Avahi advertisement during an active sharing session.
 pub struct MdnsAdvertiser {
     stop_flag: Arc<AtomicBool>,
     responder_thread: Option<JoinHandle<()>>,
-    avahi_child: Option<Child>,
+    avahi_children: Vec<Child>,
     pub advertised_hostname: String,
     pub active_method: String,
 }
 
 impl MdnsAdvertiser {
-    /// Starts best-effort mDNS advertisement for `interface_ip` and `service_port`.
-    pub fn start(interface_ip: Ipv4Addr, service_port: u16, service_type: &str) -> Self {
+    /// Starts best-effort mDNS / DNS-SD advertisement for `interface_ip` and all active services.
+    pub fn start_services(interface_ip: Ipv4Addr, services: &[MdnsServiceSpec]) -> Self {
         let (_short_host, mdns_host) = get_local_hostname();
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // 1. Try spawning avahi-publish on Linux if avahi-daemon is active
+        // 1. Spawn `avahi-publish` for every active protocol (`_smb._tcp`, `_webdav._tcp`, `_http._tcp`)
         #[cfg(unix)]
-        let avahi_child = {
-            let mut child_opt = None;
-            if Command::new("avahi-publish")
+        let avahi_children = {
+            let mut list = Vec::new();
+            let has_avahi = Command::new("avahi-publish")
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                let svc_name = format!("LabDrop ({_short_host})");
-                if let Ok(child) = Command::new("avahi-publish")
-                    .args([
-                        "-s",
-                        &svc_name,
-                        service_type,
-                        &service_port.to_string(),
-                        "path=/",
-                    ])
-                    .current_dir(std::env::temp_dir())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    child_opt = Some(child);
+                .unwrap_or(false);
+            if has_avahi {
+                for svc in services {
+                    let label = if svc.service_type == "_smb._tcp" {
+                        format!("LabDrop ({_short_host})")
+                    } else if svc.service_type == "_webdav._tcp" {
+                        format!("LabDrop WebDAV ({_short_host})")
+                    } else {
+                        format!("LabDrop Web ({_short_host})")
+                    };
+                    let path_arg = format!("path={}", svc.txt_path);
+                    if let Ok(child) = Command::new("avahi-publish")
+                        .args([
+                            "-s",
+                            &label,
+                            &svc.service_type,
+                            &svc.port.to_string(),
+                            &path_arg,
+                        ])
+                        .current_dir(std::env::temp_dir())
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        list.push(child);
+                    }
                 }
             }
-            child_opt
+            list
         };
         #[cfg(not(unix))]
-        let avahi_child: Option<Child> = {
-            let _ = (service_port, service_type);
-            None
-        };
+        let avahi_children: Vec<Child> = Vec::new();
 
-        // 2. Also start lightweight pure-Rust UDP mDNS responder for `<hostname>.local` and `labdrop.local`
+        // 2. Also start lightweight pure-Rust UDP mDNS / DNS-SD responder
         let flag_clone = Arc::clone(&stop_flag);
         let mdns_clone = mdns_host.clone();
-        let responder_thread = spawn_udp_mdns_responder(interface_ip, mdns_clone, flag_clone);
+        let services_owned = services.to_vec();
+        let responder_thread =
+            spawn_udp_mdns_responder(interface_ip, mdns_clone, services_owned, flag_clone);
 
-        let active_method = match (&avahi_child, &responder_thread) {
-            (Some(_), Some(_)) => "Avahi + UDP mDNS (.local best-effort; use IP directly if blocked)".to_string(),
-            (Some(_), None) => "Avahi mDNS (.local best-effort; use IP directly if blocked)".to_string(),
-            (None, Some(_)) => "Embedded UDP mDNS (.local best-effort; use IP directly if blocked)".to_string(),
-            (None, None) => "Direct IP only (mDNS port 5353 unavailable)".to_string(),
+        let active_method = match (!avahi_children.is_empty(), &responder_thread) {
+            (true, Some(_)) => {
+                "Avahi DNS-SD + Embedded UDP mDNS (.local + file manager browse)".to_string()
+            }
+            (true, None) => "Avahi DNS-SD (.local + file manager browse)".to_string(),
+            (false, Some(_)) => "Embedded UDP mDNS / DNS-SD (.local + browse)".to_string(),
+            (false, None) => "Direct IP / WSD / SSDP only (mDNS port 5353 unavailable)".to_string(),
         };
 
         Self {
             stop_flag,
             responder_thread,
-            avahi_child,
+            avahi_children,
             advertised_hostname: mdns_host,
             active_method,
         }
     }
 
-    pub fn avahi_pid(&self) -> Option<u32> {
-        self.avahi_child.as_ref().map(|c| c.id())
+    /// Starts single-service mDNS advertisement (convenience wrapper).
+    pub fn start(interface_ip: Ipv4Addr, service_port: u16, service_type: &str) -> Self {
+        Self::start_services(
+            interface_ip,
+            &[MdnsServiceSpec {
+                service_type: service_type.to_string(),
+                port: service_port,
+                txt_path: "/".to_string(),
+            }],
+        )
+    }
+
+    pub fn avahi_pids(&self) -> Vec<u32> {
+        self.avahi_children.iter().map(|c| c.id()).collect()
     }
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(mut child) = self.avahi_child.take() {
+        for mut child in self.avahi_children.drain(..) {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -454,17 +483,14 @@ impl Drop for MdnsAdvertiser {
 fn spawn_udp_mdns_responder(
     interface_ip: Ipv4Addr,
     mdns_hostname: String,
+    services: Vec<MdnsServiceSpec>,
     stop_flag: Arc<AtomicBool>,
 ) -> Option<JoinHandle<()>> {
     let multicast_ip = Ipv4Addr::new(224, 0, 0, 251);
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 5353)).ok()?;
-    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
-    let _ = sock.join_multicast_v4(&multicast_ip, &interface_ip);
+    let sock = crate::discovery::bind_reusable_multicast_udp(5353, multicast_ip, interface_ip)?;
 
-    let target_names = [
-        mdns_hostname.trim_end_matches('.').to_lowercase(),
-        "labdrop.local".to_string(),
-    ];
+    let host_fqdn = mdns_hostname.trim_end_matches('.').to_lowercase();
+    let target_names = [host_fqdn.clone(), "labdrop.local".to_string()];
 
     Some(thread::spawn(move || {
         let mut buf = [0u8; 1500];
@@ -475,14 +501,164 @@ fn spawn_udp_mdns_responder(
             if len < 12 {
                 continue;
             }
-            if let Some(resp) =
-                build_mdns_a_response(&buf[..len], &target_names, interface_ip)
+            if let Some(resp) = build_mdns_a_response(&buf[..len], &target_names, interface_ip) {
+                let _ = sock.send_to(&resp, src);
+                let _ = sock.send_to(&resp, SocketAddrV4::new(multicast_ip, 5353));
+            } else if let Some(resp) =
+                build_mdns_dnssd_ptr_response(&buf[..len], &host_fqdn, &services, interface_ip)
             {
                 let _ = sock.send_to(&resp, src);
                 let _ = sock.send_to(&resp, SocketAddrV4::new(multicast_ip, 5353));
             }
         }
     }))
+}
+
+fn encode_dns_name(fqdn: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in fqdn.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+/// Builds a minimal mDNS DNS-SD `PTR` + `SRV` + `TXT` + `A` response for `_smb._tcp.local`,
+/// `_webdav._tcp.local`, `_http._tcp.local`, or `_services._dns-sd._udp.local`.
+pub fn build_mdns_dnssd_ptr_response(
+    packet: &[u8],
+    host_fqdn: &str,
+    services: &[MdnsServiceSpec],
+    ip: Ipv4Addr,
+) -> Option<Vec<u8>> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    if (flags & 0x8000) != 0 {
+        return None;
+    }
+    if u16::from_be_bytes([packet[4], packet[5]]) == 0 {
+        return None;
+    }
+
+    let mut pos = 12usize;
+    let mut labels = Vec::new();
+    while pos < packet.len() {
+        let l = packet[pos] as usize;
+        pos += 1;
+        if l == 0 {
+            break;
+        }
+        if (l & 0xC0) != 0 || pos + l > packet.len() {
+            return None;
+        }
+        let label = std::str::from_utf8(&packet[pos..pos + l]).ok()?;
+        labels.push(label.to_lowercase());
+        pos += l;
+    }
+    if pos + 4 > packet.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+    // QTYPE 12 (PTR) or 255 (ANY)
+    if qtype != 12 && qtype != 255 {
+        return None;
+    }
+
+    let queried_name = labels.join(".");
+    let short_host = host_fqdn.split('.').next().unwrap_or("labdrop");
+
+    let mut answers = Vec::new();
+    let mut ancount = 0u16;
+
+    if queried_name == "_services._dns-sd._udp.local" {
+        let qname_wire = encode_dns_name(&queried_name);
+        for svc in services {
+            let svc_fqdn = format!("{}.local", svc.service_type);
+            let rdata = encode_dns_name(&svc_fqdn);
+            answers.extend_from_slice(&qname_wire);
+            answers.extend_from_slice(&12u16.to_be_bytes()); // PTR
+            answers.extend_from_slice(&0x0001u16.to_be_bytes()); // IN
+            answers.extend_from_slice(&120u32.to_be_bytes());
+            answers.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            answers.extend_from_slice(&rdata);
+            ancount += 1;
+        }
+    } else {
+        for svc in services {
+            let svc_fqdn = format!("{}.local", svc.service_type);
+            if queried_name != svc_fqdn {
+                continue;
+            }
+            let inst_fqdn = format!("LabDrop-{short_host}.{svc_fqdn}");
+            let svc_wire = encode_dns_name(&svc_fqdn);
+            let inst_wire = encode_dns_name(&inst_fqdn);
+            let host_wire = encode_dns_name(host_fqdn);
+
+            // 1. PTR record
+            answers.extend_from_slice(&svc_wire);
+            answers.extend_from_slice(&12u16.to_be_bytes());
+            answers.extend_from_slice(&0x0001u16.to_be_bytes());
+            answers.extend_from_slice(&120u32.to_be_bytes());
+            answers.extend_from_slice(&(inst_wire.len() as u16).to_be_bytes());
+            answers.extend_from_slice(&inst_wire);
+            ancount += 1;
+
+            // 2. SRV record
+            let mut srv_rdata = Vec::new();
+            srv_rdata.extend_from_slice(&0u16.to_be_bytes()); // priority
+            srv_rdata.extend_from_slice(&0u16.to_be_bytes()); // weight
+            srv_rdata.extend_from_slice(&svc.port.to_be_bytes());
+            srv_rdata.extend_from_slice(&host_wire);
+            answers.extend_from_slice(&inst_wire);
+            answers.extend_from_slice(&33u16.to_be_bytes()); // SRV
+            answers.extend_from_slice(&0x8001u16.to_be_bytes());
+            answers.extend_from_slice(&120u32.to_be_bytes());
+            answers.extend_from_slice(&(srv_rdata.len() as u16).to_be_bytes());
+            answers.extend_from_slice(&srv_rdata);
+            ancount += 1;
+
+            // 3. TXT record (`path=...`)
+            let txt_kv = format!("path={}", svc.txt_path);
+            let mut txt_rdata = vec![txt_kv.len().min(255) as u8];
+            txt_rdata.extend_from_slice(&txt_kv.as_bytes()[..txt_kv.len().min(255)]);
+            answers.extend_from_slice(&inst_wire);
+            answers.extend_from_slice(&16u16.to_be_bytes()); // TXT
+            answers.extend_from_slice(&0x8001u16.to_be_bytes());
+            answers.extend_from_slice(&120u32.to_be_bytes());
+            answers.extend_from_slice(&(txt_rdata.len() as u16).to_be_bytes());
+            answers.extend_from_slice(&txt_rdata);
+            ancount += 1;
+
+            // 4. A record
+            answers.extend_from_slice(&host_wire);
+            answers.extend_from_slice(&1u16.to_be_bytes()); // A
+            answers.extend_from_slice(&0x8001u16.to_be_bytes());
+            answers.extend_from_slice(&120u32.to_be_bytes());
+            answers.extend_from_slice(&4u16.to_be_bytes());
+            answers.extend_from_slice(&ip.octets());
+            ancount += 1;
+        }
+    }
+
+    if ancount == 0 {
+        return None;
+    }
+
+    let mut resp = Vec::with_capacity(12 + answers.len());
+    resp.extend_from_slice(&packet[0..2]);
+    resp.extend_from_slice(&0x8400u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&ancount.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&answers);
+    Some(resp)
 }
 
 /// Minimal DNS packet parser/responder for mDNS `A` (IPv4) queries matching our hostname.

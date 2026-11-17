@@ -1,3 +1,6 @@
+use crate::discovery::{
+    build_wsd_http_get_response, render_upnp_description_xml, DiscoveryConfig,
+};
 use crate::error::{LabDropError, Result};
 use crate::fs_space::format_bytes;
 use crate::staging::StagingManifest;
@@ -41,6 +44,26 @@ impl EmbeddedFileServer {
         manifest: Option<StagingManifest>,
         tracker: Arc<TransferTracker>,
     ) -> Result<Self> {
+        Self::start_with_discovery(
+            interface_ip,
+            preferred_port,
+            mode,
+            staged_dir,
+            manifest,
+            tracker,
+            None,
+        )
+    }
+
+    pub fn start_with_discovery(
+        interface_ip: Ipv4Addr,
+        preferred_port: u16,
+        mode: EmbeddedServerMode,
+        staged_dir: PathBuf,
+        manifest: Option<StagingManifest>,
+        tracker: Arc<TransferTracker>,
+        mut discovery_cfg: Option<DiscoveryConfig>,
+    ) -> Result<Self> {
         let canonical_root = fs::canonicalize(&staged_dir).map_err(|e| LabDropError::IoPath {
             path: staged_dir.clone(),
             source: e,
@@ -61,6 +84,11 @@ impl EmbeddedFileServer {
         primary_listener
             .set_nonblocking(true)
             .map_err(LabDropError::Io)?;
+
+        if let Some(ref mut d) = discovery_cfg {
+            d.http_port = Some(actual_port);
+        }
+        let discovery_arc = Arc::new(discovery_cfg);
 
         let mut listeners = vec![primary_listener];
         if !interface_ip.is_loopback() && !interface_ip.is_unspecified() {
@@ -87,9 +115,10 @@ impl EmbeddedFileServer {
             let root = canonical_root.clone();
             let shas = Arc::clone(&sha_map);
             let trk = Arc::clone(&tracker);
+            let disc = Arc::clone(&discovery_arc);
 
             let handle = thread::spawn(move || {
-                accept_loop(listener, stop, root, shas, trk, mode);
+                accept_loop(listener, stop, root, shas, trk, mode, disc);
             });
             accept_threads.push(handle);
         }
@@ -129,6 +158,7 @@ fn accept_loop(
     sha_map: Arc<HashMap<String, String>>,
     tracker: Arc<TransferTracker>,
     mode: EmbeddedServerMode,
+    discovery: Arc<Option<DiscoveryConfig>>,
 ) {
     while !stop_flag.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -137,8 +167,9 @@ fn accept_loop(
                 let root = canonical_root.clone();
                 let shas = Arc::clone(&sha_map);
                 let trk = Arc::clone(&tracker);
+                let disc = Arc::clone(&discovery);
                 thread::spawn(move || {
-                    let _ = handle_client(stream, peer_addr, stop, &root, &shas, &trk, mode);
+                    let _ = handle_client(stream, peer_addr, stop, &root, &shas, &trk, mode, &disc);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -156,7 +187,6 @@ struct HttpRequest {
     method: String,
     raw_target: String,
     headers: HashMap<String, String>,
-    #[expect(dead_code, reason = "Drained from socket for WebDAV PROPFIND compatibility")]
     body: Vec<u8>,
 }
 
@@ -210,6 +240,7 @@ fn read_http_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -218,11 +249,39 @@ fn handle_client(
     sha_map: &HashMap<String, String>,
     tracker: &TransferTracker,
     mode: EmbeddedServerMode,
+    discovery: &Option<DiscoveryConfig>,
 ) -> std::io::Result<()> {
     let client_ip = peer_addr.ip().to_string();
     let Some(req) = read_http_request(&mut stream) else {
         return Ok(());
     };
+
+    // Virtual UPnP device description endpoint for Windows Network Discovery (`Other Devices`)
+    if let Some(ref disc) = discovery {
+        if req.method == "GET" && req.raw_target == "/upnp/description.xml" {
+            let xml = render_upnp_description_xml(disc);
+            return send_simple_response(
+                &mut stream,
+                "200 OK",
+                "text/xml; charset=utf-8",
+                xml.as_bytes(),
+                &[],
+            );
+        }
+        // Virtual WS-Discovery metadata endpoint (`POST /wsd/<uuid>`) for Windows Network Computers
+        let wsd_path = format!("/wsd/{}", disc.device_uuid);
+        if req.method == "POST" && req.raw_target == wsd_path {
+            let req_body = String::from_utf8_lossy(&req.body);
+            let soap = build_wsd_http_get_response(&req_body, disc);
+            return send_simple_response(
+                &mut stream,
+                "200 OK",
+                "application/soap+xml; charset=utf-8",
+                soap.as_bytes(),
+                &[],
+            );
+        }
+    }
 
     // Determine whether this request is WebDAV or standard HTTP
     let is_webdav_req = matches!(req.method.as_str(), "PROPFIND" | "OPTIONS")
