@@ -244,13 +244,14 @@ pub fn render_upnp_description_xml(cfg: &DiscoveryConfig) -> String {
              <manufacturerURL>https://github.com/4mrco/labdrop</manufacturerURL>\n\
              <modelDescription>LabDrop Portable Laboratory File Share</modelDescription>\n\
              <modelName>LabDrop</modelName>\n\
-             <modelNumber>0.1</modelNumber>\n\
+             <modelNumber>{ver}</modelNumber>\n\
              <serialNumber>{sess}</serialNumber>\n\
              <UDN>uuid:{uuid}</UDN>\n\
              <presentationURL>http://{ip}:{port}/</presentationURL>\n\
            </device>\n\
          </root>\n",
         host = xml_escape(&cfg.hostname),
+        ver = env!("CARGO_PKG_VERSION"),
         sess = xml_escape(&cfg.session_id),
         uuid = xml_escape(&cfg.device_uuid),
         ip = cfg.interface_ip,

@@ -1266,7 +1266,7 @@ fn draw_ui(f: &mut Frame, app: &LabDropTuiApp) {
 
     let header_line = Line::from(vec![
         Span::styled(
-            " LabDrop v0.1.0 ",
+            concat!(" LabDrop v", env!("CARGO_PKG_VERSION"), " "),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

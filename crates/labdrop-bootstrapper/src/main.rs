@@ -409,7 +409,7 @@ fn draw_bootstrapper_ui(f: &mut Frame, app: &BootstrapperTuiApp) {
 
     let hdr = Paragraph::new(Line::from(vec![
         Span::styled(
-            " LabDrop USB Bootstrapper v0.1.0 ",
+            concat!(" LabDrop USB Bootstrapper v", env!("CARGO_PKG_VERSION"), " "),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
