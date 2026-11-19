@@ -163,6 +163,9 @@ fn accept_loop(
     while !stop_flag.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer_addr)) => {
+                // On Windows (Winsock2), accepted sockets inherit the listener's non-blocking mode.
+                // Explicitly switch back to blocking mode so large responses do not fail with WouldBlock.
+                let _ = stream.set_nonblocking(false);
                 let stop = Arc::clone(&stop_flag);
                 let root = canonical_root.clone();
                 let shas = Arc::clone(&sha_map);

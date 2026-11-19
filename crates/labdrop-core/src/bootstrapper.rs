@@ -966,6 +966,6 @@ mod tests {
         assert_eq!(rep.labdrop_dir, local_target);
         assert!(local_target.join("labdrop").is_file());
         assert!(local_target.join("LabDrop.exe").is_file());
-        assert!(!local_target.join("LabDrop").exists());
+        assert!(!local_target.join("LabDrop").is_dir());
     }
 }

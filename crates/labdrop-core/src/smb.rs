@@ -209,7 +209,9 @@ pub fn probe_smb_environment() -> SmbEnvironmentStatus {
                 "--map-root-user",
                 "--map-users=auto",
                 "--map-groups=auto",
-                "true",
+                "sh",
+                "-c",
+                "case \"$(cat /proc/self/attr/apparmor/current /proc/self/attr/current 2>/dev/null)\" in *unprivileged_userns*) exit 1 ;; esac; if command -v setpriv >/dev/null 2>&1; then setpriv --reuid=0 --regid=0 --clear-groups true; fi",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -441,10 +443,12 @@ fn start_linux_rootless_smb(
          state directory = {lock}\n\
          cache directory = {lock}\n\
          private dir = {priv_d}\n\
+         smb passwd file = {priv_d}/smbpasswd\n\
          ncalrpc dir = {ncalrpc}\n\
          log file = {log}\n\
          log level = 2\n\
          max log size = 5000\n\
+         usershare max shares = 0\n\
          load printers = no\n\
          printing = bsd\n\
          printcap name = /dev/null\n\
@@ -488,8 +492,14 @@ fn start_linux_rootless_smb(
         }
     }
 
+    let stderr_log_file = log_dir.join("smbd.stderr.log");
+    let stderr_stdio = fs::File::create(&stderr_log_file)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+
     let shell_cmd = format!(
-        "exec </dev/null; exec smbd -F --no-process-group --configfile='{}'",
+        "exec </dev/null; exec smbd -F --no-process-group --log-basename='{}' --configfile='{}'",
+        log_dir.display(),
         conf_file.display()
     );
     let mut cmd = Command::new("unshare");
@@ -506,7 +516,7 @@ fn start_linux_rootless_smb(
     .current_dir(session_dir)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    .stderr(stderr_stdio);
 
     // Place unshare + smbd + smbd-notifyd + smbd-cleanupd in an isolated session/process group
     // so cleanup kills the entire process tree via killpg(-pgid).
@@ -533,8 +543,28 @@ fn start_linux_rootless_smb(
             break;
         }
         if let Ok(Some(status)) = child.try_wait() {
+            let mut detail = String::new();
+            for p in [&stderr_log_file, &log_file] {
+                if let Ok(content) = fs::read_to_string(p) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        let tail: Vec<&str> = trimmed.lines().rev().take(8).collect();
+                        let snippet: String =
+                            tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+                        if !detail.is_empty() {
+                            detail.push_str("; ");
+                        }
+                        detail.push_str(&snippet);
+                    }
+                }
+            }
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            };
             return Err(LabDropError::Smb(format!(
-                "Rootless smbd exited prematurely with status {status}"
+                "Rootless smbd exited prematurely with status {status}{suffix}"
             )));
         }
         thread::sleep(Duration::from_millis(100));
