@@ -87,15 +87,17 @@ jobs:
       - name: Build Native Windows Release Executables
         run: |
           cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
-          Copy-Item target\x86_64-pc-windows-msvc\release\labdrop.exe target\x86_64-pc-windows-msvc\release\LabDrop.exe
+          New-Item -ItemType Directory -Force dist-win | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\labdrop.exe dist-win\LabDrop.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\labdrop-bootstrapper.exe dist-win\labdrop-bootstrapper.exe
 
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: labdrop-windows-x86_64
           path: |
-            target/x86_64-pc-windows-msvc/release/LabDrop.exe
-            target/x86_64-pc-windows-msvc/release/labdrop-bootstrapper.exe
+            dist-win/LabDrop.exe
+            dist-win/labdrop-bootstrapper.exe
 
   package-and-verify-usb:
     name: Package & Verify Cross-Platform USB Bundle
